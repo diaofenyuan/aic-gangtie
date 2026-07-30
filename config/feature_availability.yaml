@@ -1,0 +1,350 @@
+# 字段时间语义注册表。未列出字段默认禁止进入正式短/长周期模型。
+# min_lag_steps 是字段相对预测起点允许使用的最小滞后步数；0 表示当前点可用。
+fields:
+  generator_1:
+    source_file: load.csv
+    timestamp_meaning: 机组一组负荷在采样时刻的观测值
+    collection_time: 采集系统写入时间，待官方确认
+    event_time: 负荷实际发生时间
+    available_at_origin: true
+    min_lag_steps: 0
+    is_label: true
+    allow_short: true
+    allow_long: true
+    pending: 请确认测试起点是否包含该时刻实测负荷
+  generator_all:
+    source_file: load.csv
+    timestamp_meaning: 全部机组负荷在采样时刻的观测值
+    collection_time: 采集系统写入时间，待官方确认
+    event_time: 负荷实际发生时间
+    available_at_origin: true
+    min_lag_steps: 0
+    is_label: true
+    allow_short: true
+    allow_long: true
+    pending: 请确认测试起点是否包含该时刻实测负荷
+  generator_2:
+    source_file: load.csv
+    timestamp_meaning: 合成数据中的第二组机组负荷
+    collection_time: 采集时间待确认
+    event_time: 负荷实际发生时间
+    available_at_origin: false
+    min_lag_steps: 1
+    allow_short: false
+    allow_long: false
+    pending: 真实字段含义和可用时间待确认，仅用于关系发现
+  generator_3:
+    source_file: load.csv
+    timestamp_meaning: 合成数据中的第三组机组负荷
+    collection_time: 采集时间待确认
+    event_time: 负荷实际发生时间
+    available_at_origin: false
+    min_lag_steps: 1
+    allow_short: false
+    allow_long: false
+    pending: 真实字段含义和可用时间待确认，仅用于关系发现
+  blast_furnace_1:
+    source_file: gas.csv
+    timestamp_meaning: 高炉煤气发生量
+    collection_time: 采集时间待确认
+    event_time: 发生量统计时段待确认
+    available_at_origin: true
+    min_lag_steps: 1
+    allow_short: true
+    allow_long: true
+    pending: PDF 允许使用参考时刻之前的数据；正式数据接入后仍需确认结算延迟
+  coke_oven_1:
+    source_file: gas.csv
+    timestamp_meaning: 焦炉煤气发生量
+    collection_time: 采集时间待确认
+    event_time: 发生量统计时段待确认
+    available_at_origin: true
+    min_lag_steps: 1
+    allow_short: true
+    allow_long: true
+    pending: PDF 允许使用参考时刻之前的数据；正式数据接入后仍需确认结算延迟
+  converter_1:
+    source_file: gas.csv
+    timestamp_meaning: 转炉煤气发生量
+    collection_time: 采集时间待确认
+    event_time: 发生量统计时段待确认
+    available_at_origin: true
+    min_lag_steps: 1
+    allow_short: true
+    allow_long: true
+    pending: PDF 允许使用参考时刻之前的数据；正式数据接入后仍需确认结算延迟
+  blast_furnace_user1:
+    source_file: gas_user.csv
+    timestamp_meaning: 高炉煤气用户侧消耗量
+    collection_time: 采集时间待确认
+    event_time: 用户消耗统计时段待确认
+    available_at_origin: true
+    min_lag_steps: 1
+    allow_short: true
+    allow_long: true
+    pending: 按至少滞后一格使用；正式数据接入后确认采集延迟
+  coke_oven_user1:
+    source_file: gas_user.csv
+    timestamp_meaning: 焦炉煤气用户侧消耗量
+    collection_time: 采集时间待确认
+    event_time: 用户消耗统计时段待确认
+    available_at_origin: true
+    min_lag_steps: 1
+    allow_short: true
+    allow_long: true
+    pending: 按至少滞后一格使用；正式数据接入后确认采集延迟
+  converter_user1:
+    source_file: gas_user.csv
+    timestamp_meaning: 转炉煤气用户侧消耗量
+    collection_time: 采集时间待确认
+    event_time: 用户消耗统计时段待确认
+    available_at_origin: true
+    min_lag_steps: 1
+    allow_short: true
+    allow_long: true
+    pending: 按至少滞后一格使用；正式数据接入后确认采集延迟
+  blast_furnace_process_demand:
+    source_file: gas.csv
+    timestamp_meaning: 热风炉等高炉生产附属设备耗气汇总
+    collection_time: 采集延迟待数据字典确认
+    event_time: 消耗统计时段
+    available_at_origin: true
+    min_lag_steps: 1
+    allow_short: true
+    allow_long: true
+    pending: 按至少滞后一格使用
+  coke_oven_process_demand:
+    source_file: gas.csv
+    timestamp_meaning: 焦炉生产附属设备耗气汇总
+    collection_time: 采集延迟待数据字典确认
+    event_time: 消耗统计时段
+    available_at_origin: true
+    min_lag_steps: 1
+    allow_short: true
+    allow_long: true
+    pending: 正式字段模式待 data_dictionary.xlsx 确认
+  converter_process_demand:
+    source_file: gas.csv
+    timestamp_meaning: 转炉生产附属设备耗气汇总
+    collection_time: 采集延迟待数据字典确认
+    event_time: 消耗统计时段
+    available_at_origin: true
+    min_lag_steps: 1
+    allow_short: true
+    allow_long: true
+    pending: 正式字段模式待 data_dictionary.xlsx 确认
+  blast_furnace_mixed_input:
+    source_file: gas.csv
+    timestamp_meaning: 进入混气站的高炉煤气量
+    collection_time: 采集延迟待数据字典确认
+    event_time: 混气站入口统计时段
+    available_at_origin: true
+    min_lag_steps: 1
+    allow_short: true
+    allow_long: true
+    pending: 按优先生产消耗处理，避免与下游混合煤气用户重复扣减
+  coke_oven_mixed_input:
+    source_file: gas.csv
+    timestamp_meaning: 进入混气站的焦炉煤气量
+    collection_time: 采集延迟待数据字典确认
+    event_time: 混气站入口统计时段
+    available_at_origin: true
+    min_lag_steps: 1
+    allow_short: true
+    allow_long: true
+    pending: 按优先生产消耗处理，避免与下游混合煤气用户重复扣减
+  converter_mixed_input:
+    source_file: gas.csv
+    timestamp_meaning: 进入混气站的转炉煤气量
+    collection_time: 采集延迟待数据字典确认
+    event_time: 混气站入口统计时段
+    available_at_origin: true
+    min_lag_steps: 1
+    allow_short: true
+    allow_long: true
+    pending: 按优先生产消耗处理，避免与下游混合煤气用户重复扣减
+  mixed_gas_user1:
+    source_file: gas_user.csv
+    timestamp_meaning: 混合煤气用户需求汇总
+    collection_time: 采集延迟待数据字典确认
+    event_time: 用户消耗统计时段
+    available_at_origin: true
+    min_lag_steps: 1
+    allow_short: true
+    allow_long: true
+    pending: 仅作为历史预测特征；优化按混气站入口分气量建模，避免重复计量
+  blast_furnace_gas_holder_1:
+    source_file: gas_holder.csv
+    timestamp_meaning: 高炉煤气柜库存
+    collection_time: 采集时间待确认
+    event_time: 气柜状态时刻
+    available_at_origin: true
+    min_lag_steps: 1
+    allow_short: true
+    allow_long: true
+    pending: 按至少滞后一格使用；正式数据接入后确认采集延迟
+  coke_oven_gas_holder_1:
+    source_file: gas_holder.csv
+    timestamp_meaning: 焦炉煤气柜库存
+    collection_time: 采集时间待确认
+    event_time: 气柜状态时刻
+    available_at_origin: true
+    min_lag_steps: 1
+    allow_short: true
+    allow_long: true
+    pending: 按至少滞后一格使用；正式数据接入后确认采集延迟
+  converter_gas_holder_1:
+    source_file: gas_holder.csv
+    timestamp_meaning: 转炉煤气柜库存
+    collection_time: 采集时间待确认
+    event_time: 气柜状态时刻
+    available_at_origin: true
+    min_lag_steps: 1
+    allow_short: true
+    allow_long: true
+    pending: 按至少滞后一格使用；正式数据接入后确认采集延迟
+  generator_use_blast_furnace_gas:
+    source_file: load.csv
+    timestamp_meaning: 发电使用高炉煤气量
+    collection_time: 采集时间待确认
+    event_time: 发电消耗统计时段待确认
+    available_at_origin: true
+    min_lag_steps: 1
+    allow_short: true
+    allow_long: true
+    pending: 只使用至少滞后一格的历史耗气，不使用目标时段耗气
+  generator_use_coke_gas:
+    source_file: load.csv
+    timestamp_meaning: 发电使用焦炉煤气量
+    collection_time: 采集时间待确认
+    event_time: 发电消耗统计时段待确认
+    available_at_origin: true
+    min_lag_steps: 1
+    allow_short: true
+    allow_long: true
+    pending: 只使用至少滞后一格的历史耗气，不使用目标时段耗气
+  generator_use_converter_gas:
+    source_file: load.csv
+    timestamp_meaning: 发电使用转炉煤气量
+    collection_time: 采集时间待确认
+    event_time: 发电消耗统计时段待确认
+    available_at_origin: true
+    min_lag_steps: 1
+    allow_short: true
+    allow_long: true
+    pending: 只使用至少滞后一格的历史耗气，不使用目标时段耗气
+  electricity_price:
+    source_file: price.xlsx
+    timestamp_meaning: 江苏省逐月分时电价计划
+    collection_time: 赛题提供的全年计划文件
+    event_time: 价格生效时刻
+    available_at_origin: true
+    min_lag_steps: 0
+    is_plan: true
+    allow_short: true
+    allow_long: true
+    known_ahead_steps: 96
+    pending: 正式接入时按 price.xlsx 的月份和时段表展开，不使用未来实测价格
+  legal_dispatch_plan:
+    source_file: audit_scenarios.csv
+    timestamp_meaning: 已提前发布的调度计划量
+    collection_time: 计划发布时间
+    event_time: 计划生效时刻
+    available_at_origin: true
+    min_lag_steps: 0
+    is_plan: true
+    allow_short: false
+    allow_long: false
+    known_ahead_steps: 96
+    pending: 合成数据演示字段，真实数据需确认发布时点
+  future_generator_all_leak:
+    source_file: audit_scenarios.csv
+    timestamp_meaning: 故意将未来目标平移到当前行的诊断字段
+    collection_time: 不适用
+    event_time: 未来目标时刻
+    available_at_origin: false
+    min_lag_steps: 1
+    is_label: true
+    allow_short: false
+    allow_long: false
+    pending: 故意泄漏字段，只能用于审计测试
+  timestamp_advanced_generator_all:
+    source_file: audit_scenarios.csv
+    timestamp_meaning: 故意时间戳提前一格的诊断字段
+    collection_time: 不适用
+    event_time: 未来目标时刻
+    available_at_origin: false
+    min_lag_steps: 1
+    allow_short: false
+    allow_long: false
+    pending: 故意错位字段，只能用于审计测试
+  delayed_generator_all_sensor:
+    source_file: audit_scenarios.csv
+    timestamp_meaning: 故意延迟两个15分钟点的跨表传感器
+    collection_time: 延迟采集
+    event_time: 历史负荷时刻
+    available_at_origin: false
+    min_lag_steps: 1
+    allow_short: false
+    allow_long: false
+    pending: 合成固定时延字段，只用于关系审计
+  scenario_constant_load:
+    source_file: audit_scenarios.csv
+    timestamp_meaning: 完全恒定负荷场景
+    collection_time: 合成诊断
+    event_time: 合成诊断
+    available_at_origin: false
+    min_lag_steps: 1
+    allow_short: false
+    allow_long: false
+    pending: 合成场景字段，不进入正式模型
+  scenario_piecewise_load:
+    source_file: audit_scenarios.csv
+    timestamp_meaning: 分段恒定负荷场景
+    collection_time: 合成诊断
+    event_time: 合成诊断
+    available_at_origin: false
+    min_lag_steps: 1
+    allow_short: false
+    allow_long: false
+    pending: 合成场景字段，不进入正式模型
+  scenario_periodic_load:
+    source_file: audit_scenarios.csv
+    timestamp_meaning: 平稳周期负荷场景
+    collection_time: 合成诊断
+    event_time: 合成诊断
+    available_at_origin: false
+    min_lag_steps: 1
+    allow_short: false
+    allow_long: false
+    pending: 合成场景字段，不进入正式模型
+  scenario_linear_ramp_load:
+    source_file: audit_scenarios.csv
+    timestamp_meaning: 线性爬坡负荷场景
+    collection_time: 合成诊断
+    event_time: 合成诊断
+    available_at_origin: false
+    min_lag_steps: 1
+    allow_short: false
+    allow_long: false
+    pending: 合成场景字段，不进入正式模型
+  scenario_start_stop_load:
+    source_file: audit_scenarios.csv
+    timestamp_meaning: 机组启停场景
+    collection_time: 合成诊断
+    event_time: 合成诊断
+    available_at_origin: false
+    min_lag_steps: 1
+    allow_short: false
+    allow_long: false
+    pending: 合成场景字段，不进入正式模型
+  boundary_signal:
+    source_file: audit_scenarios.csv
+    timestamp_meaning: 重采样边界诊断信号
+    collection_time: 合成诊断
+    event_time: 合成诊断
+    available_at_origin: false
+    min_lag_steps: 1
+    allow_short: false
+    allow_long: false
+    pending: 合成重采样边界字段，不进入正式模型

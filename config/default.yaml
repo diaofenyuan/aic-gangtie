@@ -1,0 +1,392 @@
+project:
+  name: gas_power_competition
+  seed: 2026
+
+paths:
+  # 相对路径以本配置文件所在目录为基准。
+  root: ".."
+  data: "data"
+  outputs: "outputs"
+  cache: "cache"
+  logs: "logs"
+  models: "models"
+
+logging:
+  level: INFO
+  filename: pipeline.log
+
+runtime:
+  # 当前机器有 16 个逻辑处理器；命令行可通过 --workers 临时覆盖。
+  workers: 16
+  progress: true
+
+performance:
+  max_seconds_per_sample: 30.0
+  max_total_inference_seconds: 1800.0
+  enforce_limits: true
+
+time_semantics:
+  availability_file: "config/feature_availability.yaml"
+  unknown_field_policy: deny
+  datetime_role: forecast_origin
+
+data:
+  frequency: "15min"
+  timestamp_format: "%Y-%m-%d %H:%M:%S"
+  resampling:
+    label: right
+    closed: right
+  tables:
+    gas:
+      path: "gas.csv"
+      timestamp: "datetime"
+      required: true
+      aggregation: mean
+      mappings:
+        # 同类设备按行求和；合成数据只有一座设备时仍保持原字段兼容。
+        blast_furnace_1: {sources: ["blast_furnace_1"], patterns: ["^blast_furnace_\\d+$"], combine: sum, required: true}
+        coke_oven_1: {sources: ["coke_oven_1"], patterns: ["^coke_oven_\\d+$"], combine: sum, required: true}
+        converter_1: {sources: ["converter_1"], patterns: ["^converter_\\d+$"], combine: sum, required: true}
+        blast_furnace_process_demand: {patterns: ["^air_heater_\\d+$"], combine: sum, required: false}
+        coke_oven_process_demand: {patterns: ["^coke_oven_heater_\\d+$"], combine: sum, required: false}
+        converter_process_demand: {patterns: ["^converter_process_\\d+$"], combine: sum, required: false}
+        blast_furnace_mixed_input: {sources: ["into_gas_mixed_blast_furnace"], required: false}
+        coke_oven_mixed_input: {sources: ["into_gas_mixed_coke"], required: false}
+        converter_mixed_input: {sources: ["into_gas_mixed_converter"], required: false}
+    gas_holder:
+      path: "gas_holder.csv"
+      timestamp: "datetime"
+      required: true
+      aggregation: mean
+      mappings:
+        blast_furnace_gas_holder_1: {sources: ["blast_furnace_gas_holder_1"], required: true}
+        coke_oven_gas_holder_1: {sources: ["coke_oven_gas_holder_1"], required: true}
+        converter_gas_holder_1: {sources: ["converter_gas_holder_1"], required: true}
+    gas_user:
+      path: "gas_user.csv"
+      timestamp: "datetime"
+      required: true
+      aggregation: mean
+      mappings:
+        blast_furnace_user1: {sources: ["blast_furnace_user1"], patterns: ["^blast_furnace_user\\d+$"], combine: sum, required: true}
+        coke_oven_user1: {sources: ["coke_oven_user1"], patterns: ["^coke_oven_user\\d+$"], combine: sum, required: true}
+        converter_user1: {sources: ["converter_user1"], patterns: ["^converter_user\\d+$"], combine: sum, required: true}
+        mixed_gas_user1: {patterns: ["^mixed_gas_user\\d+$"], combine: sum, required: false}
+    load:
+      path: "load.csv"
+      timestamp: "datetime"
+      required: true
+      aggregation: mean
+      mappings:
+        generator_1: {sources: ["generator_1"], required: true}
+        generator_all: {sources: ["generator_all"], required: true}
+        generator_2: {sources: ["generator_2"], required: false}
+        generator_3: {sources: ["generator_3"], required: false}
+        generator_use_blast_furnace_gas: {sources: ["generator_use_blast_furnace_gas"], required: false}
+        generator_use_coke_gas: {sources: ["generator_use_coke_gas"], required: false}
+        generator_use_converter_gas: {sources: ["generator_use_converter_gas"], required: false}
+    price:
+      path: "price.csv"
+      timestamp: "datetime"
+      required: false
+      aggregation: mean
+      mappings:
+        electricity_price: {sources: ["electricity_price"], required: false}
+    audit_scenarios:
+      path: "audit_scenarios.csv"
+      timestamp: "datetime"
+      required: false
+      aggregation: mean
+      mappings:
+        scenario_constant_load: {sources: ["scenario_constant_load"], required: false}
+        scenario_piecewise_load: {sources: ["scenario_piecewise_load"], required: false}
+        scenario_periodic_load: {sources: ["scenario_periodic_load"], required: false}
+        scenario_linear_ramp_load: {sources: ["scenario_linear_ramp_load"], required: false}
+        scenario_start_stop_load: {sources: ["scenario_start_stop_load"], required: false}
+        legal_dispatch_plan: {sources: ["legal_dispatch_plan"], required: false}
+        future_generator_all_leak: {sources: ["future_generator_all_leak"], required: false}
+        timestamp_advanced_generator_all: {sources: ["timestamp_advanced_generator_all"], required: false}
+        delayed_generator_all_sensor: {sources: ["delayed_generator_all_sensor"], required: false}
+        boundary_signal: {sources: ["boundary_signal"], required: false}
+
+  roles:
+    targets: ["generator_1", "generator_all"]
+    gas_production:
+      blast_furnace: "blast_furnace_1"
+      coke: "coke_oven_1"
+      converter: "converter_1"
+    gas_user_demand:
+      blast_furnace: "blast_furnace_user1"
+      coke: "coke_oven_user1"
+      converter: "converter_user1"
+    # 生产附属设备和混气站入口是优先生产消耗，若字段缺失则自动跳过。
+    gas_process_demand:
+      blast_furnace: ["blast_furnace_process_demand", "blast_furnace_mixed_input"]
+      coke: ["coke_oven_process_demand", "coke_oven_mixed_input"]
+      converter: ["converter_process_demand", "converter_mixed_input"]
+    mixed_gas_user_demand: "mixed_gas_user1"
+    gas_holder:
+      blast_furnace: "blast_furnace_gas_holder_1"
+      coke: "coke_oven_gas_holder_1"
+      converter: "converter_gas_holder_1"
+    generator_gas_use:
+      blast_furnace: "generator_use_blast_furnace_gas"
+      coke: "generator_use_coke_gas"
+      converter: "generator_use_converter_gas"
+    component_generators: ["generator_1", "generator_2", "generator_3"]
+    candidate_features:
+      - legal_dispatch_plan
+      - future_generator_all_leak
+      - timestamp_advanced_generator_all
+      - delayed_generator_all_sensor
+
+preprocessing:
+  duplicate_policy: mean
+  imputation:
+    method: ffill
+    limit: 8
+  outliers:
+    enabled: true
+    window: 96
+    min_periods: 24
+    iqr_multiplier: 4.0
+    replace_with: median
+
+features:
+  lag_steps: [1, 2, 4, 8, 16, 96, 672]
+  rolling_windows: [4, 8, 16, 96]
+  rolling_statistics: [mean, std, min, max, slope]
+  unit_online_threshold_mw: 1.0
+  stable_delta_threshold_mw: 2.0
+
+forecast:
+  short_steps: 8
+  long_steps: 96
+  model:
+    type: weighted_ensemble
+    clip_min: 0.0
+    components:
+      - {type: last_value, weight: 0.25}
+      - {type: window_mean, window: 8, weight: 0.20}
+      - {type: linear_trend, window: 8, weight: 0.10}
+      - {type: seasonal_naive, period_steps: 96, weight: 0.30}
+      - {type: seasonal_naive, period_steps: 672, weight: 0.15}
+  # 提升模型接口使用以下配置。默认仍运行无需额外依赖的基线融合。
+  machine_learning:
+    backend: lightgbm
+    strategy: direct       # direct: 每步长独立；global: 步长作为特征
+    target_mode: delta     # delta: 预测相对当前值变化；absolute: 预测绝对值
+    parameters:
+      n_estimators: 200
+      learning_rate: 0.05
+      num_leaves: 31
+      n_jobs: -1
+  prediction_origins:
+    mode: tail
+    count: 4
+    file: null
+
+validation:
+  mode: expanding          # expanding 或 rolling
+  folds: 2
+  initial_train_points: 1152
+  validation_points: 96
+  step_points: 192
+  rolling_train_points: 1152
+  near_zero_threshold: 1.0
+  worst_error_count: 50
+
+backtest:
+  expanding:
+    mode: expanding
+    folds: 2
+    initial_train_points: 1152
+    validation_points: 96
+    step_points: 192
+    rolling_train_points: 1152
+  rolling:
+    mode: rolling
+    folds: 2
+    initial_train_points: 1152
+    validation_points: 96
+    step_points: 192
+    rolling_train_points: 1152
+  official_two_days:
+    mode: rolling
+    folds: 1
+    initial_train_points: 1536
+    validation_points: 192
+    step_points: 192
+    rolling_train_points: 1536
+
+audit:
+  lag_min_steps: -96
+  lag_max_steps: 96
+  suspicious_keywords: [target, label, pred, prediction, future, lead, ahead]
+  high_correlation_threshold: 0.995
+  affine_residual_ratio_threshold: 0.01
+  multivariate_r2_threshold: 0.995
+  resampling_difference_threshold: 1.0e-9
+
+benchmark:
+  horizons: long
+  baselines:
+    - {name: last_value, type: last_value}
+    - {name: mean_2, type: window_mean, window: 2}
+    - {name: mean_4, type: window_mean, window: 4}
+    - {name: mean_8, type: window_mean, window: 8}
+    - {name: median_8, type: window_median, window: 8}
+    - {name: trend_15m, type: linear_trend, window: 2}
+    - {name: trend_30m, type: linear_trend, window: 3}
+    - {name: trend_60m, type: linear_trend, window: 5}
+    - {name: damped_trend_60m, type: damped_trend, window: 5, damping: 0.85}
+    - {name: yesterday, type: seasonal_naive, period_steps: 96}
+    - {name: last_week, type: seasonal_naive, period_steps: 672}
+    - name: stable_fusion
+      type: weighted_ensemble
+      components:
+        - {type: last_value, weight: 0.50}
+        - {type: damped_trend, window: 5, damping: 0.85, weight: 0.20}
+        - {type: seasonal_naive, period_steps: 96, weight: 0.30}
+  reachability:
+    stable_score_percent: 99.5
+    leaderboard_score_percent: 99.9
+    alignment_gain_percent: 1.0
+    future_only_gap_percent: 1.0
+
+scoring:
+  formula: one_minus_mape
+  display_scale: 1.0
+  target_weights:
+    generator_1: 0.5
+    generator_all: 0.5
+  horizon_weight_mode: equal
+  horizon_weights: {}
+  data_processing:
+    enabled: false
+    prediction_weight: null
+    data_weight: null
+    status: "PDF 未确认是否组合数据处理得分，默认关闭"
+
+residual_model:
+  enabled: false
+  backend: lightgbm
+  strategy: global
+  baseline: {type: last_value}
+  require_all_folds_improved: true
+  min_fold_mape_gain: 0.0001
+  status: "正式数据到达后先通过全部时间折门控，再允许进入最终融合"
+
+postprocessing:
+  enabled: true
+  non_negative: true
+  target_capacity_mw:
+    generator_1: 200.0
+    generator_all: 440.0
+  ramp_limit_mw_per_step: null
+  enforce_target_consistency: true
+
+gpu:
+  enabled: false
+  device: cuda
+  batch_size: 64
+  seed: 2026
+  min_gain_all_folds: 0.001
+  require_cpu_baselines_complete: true
+  candidate_models: [TCN, PatchTST]
+  status: "CPU 基线和提升模型稳定性未完成前禁止启用"
+
+relations:
+  max_delay_steps: 12
+  linear_r2_threshold: 0.98
+  constant_tolerance_mw: 0.05
+  setpoint_round_mw: 1.0
+  failure_quantile: 0.95
+
+submission:
+  datetime_role: forecast_origin
+  require_manifest: true
+  capacity_tolerance_mw: 1.0e-6
+  stage: preliminary
+
+synthetic:
+  start: "2025-01-15 00:00:00"
+  periods: 2016
+  missing_row_fraction: 0.004
+  missing_value_fraction: 0.002
+  duplicate_rows_per_table: 4
+  outliers_per_table: 3
+
+optimization:
+  horizon_steps: 96
+  interval_minutes: 15
+  holder_min_fraction: 0.15   # PDF 已确认
+  holder_max_fraction: 0.90   # PDF 已确认
+  holder_high_high_fraction: 0.95  # PDF 已确认，仅用于诊断
+  ramp_fraction_per_minute: 0.10   # PDF 已确认
+  units:
+    - {name: unit_50_1, group: generator_1, rated_mw: 50.0, min_fraction: 0.60, initial_on: 1, initial_load_mw: 30.0}
+    - {name: unit_50_2, group: generator_1, rated_mw: 50.0, min_fraction: 0.60, initial_on: 1, initial_load_mw: 30.0}
+    - {name: unit_50_3, group: generator_1, rated_mw: 50.0, min_fraction: 0.60, initial_on: 1, initial_load_mw: 30.0}
+    - {name: unit_50_4, group: generator_1, rated_mw: 50.0, min_fraction: 0.60, initial_on: 1, initial_load_mw: 30.0}
+    - {name: unit_120_1, group: generator_all_only, rated_mw: 120.0, min_fraction: 0.60, initial_on: 1, initial_load_mw: 72.0}
+    - {name: unit_120_2, group: generator_all_only, rated_mw: 120.0, min_fraction: 0.60, initial_on: 1, initial_load_mw: 72.0}
+  gas_types:
+    blast_furnace:
+      holder_capacity:
+        value: 200000.0
+        status: "等待官方确认三类气柜各自容量；当前值仅用于合成流程"
+      conversion_mw_per_volume:
+        value: 0.012
+        status: "等待真实热值、机组效率和流量单位确认；当前值仅用于合成流程"
+    coke:
+      holder_capacity:
+        value: 200000.0
+        status: "等待官方确认三类气柜各自容量；当前值仅用于合成流程"
+      conversion_mw_per_volume:
+        value: 0.025
+        status: "等待真实热值、机组效率和流量单位确认；当前值仅用于合成流程"
+    converter:
+      holder_capacity:
+        value: 200000.0
+        status: "等待官方确认三类气柜各自容量；当前值仅用于合成流程"
+      conversion_mw_per_volume:
+        value: 0.017
+        status: "等待真实热值、机组效率和流量单位确认；当前值仅用于合成流程"
+  objective:
+    shortage_penalty:
+      value: 1000.0
+      status: "等待官方经济性口径确认；当前值仅用于合成流程"
+    flare_penalty:
+      value: 0.05
+      status: "等待官方放散成本确认；当前值仅用于合成流程"
+    startup_penalty:
+      value: 5.0
+      status: "等待机组启停成本确认；当前值仅用于合成流程"
+    energy_revenue_scale:
+      value: 1.0
+      status: "等待电价与负荷单位换算口径确认；当前值仅用于合成流程"
+  priority_mode: lexicographic
+  require_zero_shortage: true
+  shortage_tolerance: 1.0e-6
+  resource_forecast:
+    type: weighted_ensemble
+    clip_min: 0.0
+    components:
+      - {type: last_value, weight: 0.25}
+      - {type: window_mean, window: 4, weight: 0.20}
+      - {type: damped_trend, window: 8, damping: 0.85, weight: 0.10}
+      - {type: seasonal_naive, period_steps: 96, weight: 0.30}
+      - {type: seasonal_naive, period_steps: 672, weight: 0.15}
+  fallback_price:
+    valley: {value: 0.35, status: "等待官方逐月电价文件"}
+    flat: {value: 0.65, status: "等待官方逐月电价文件"}
+    peak: {value: 1.00, status: "等待官方逐月电价文件"}
+  solver:
+    time_limit_seconds: 20
+    mip_relative_gap: 0.01
+    feasibility_tolerance: 1.0e-5
+  output_columns:
+    blast_furnace: "opt_generator_use_blast_furnace_gas"
+    coke: "opt_generator_use_coke_gas"
+    converter: "opt_generator_use_converter_gas"

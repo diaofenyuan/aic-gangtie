@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.coverage
+.venv/
+
+# 运行产物与赛事数据不进入版本控制
+data/
+cache/
+logs/
+models/
+outputs/
+reports/
+tmp/
