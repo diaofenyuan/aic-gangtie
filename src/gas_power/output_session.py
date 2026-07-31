@@ -11,6 +11,7 @@ from uuid import uuid4
 from zipfile import ZIP_DEFLATED, ZipFile
 
 from gas_power.config import ProjectConfig
+from gas_power.submission_freeze import FREEZE_MANIFEST, verify_submission_freeze
 
 
 @dataclass
@@ -61,6 +62,10 @@ class OutputSession:
                     f"无法生成提交压缩包，缺少文件: {', '.join(missing)}"
                 )
             return None
+
+        # 打包前校验冻结清单，保证提交文件在预测完成后未被改写。
+        if (self.staging_directory / FREEZE_MANIFEST).is_file():
+            verify_submission_freeze(self.staging_directory)
 
         archive_path = self.staging_directory / "提交压缩包.zip"
         with ZipFile(

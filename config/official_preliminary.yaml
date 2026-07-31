@@ -1,0 +1,99 @@
+# 初赛正式配置：训练与评分目录隔离，评分期只允许按起点读取当前及历史观测。
+extends: default.yaml
+
+project:
+  name: gas_power_preliminary
+
+paths:
+  root: ".."
+  data: "data/preliminary/train"
+  scoring_data: "data/preliminary/scoring"
+
+competition_compliance:
+  stage: preliminary
+  offline_only: true
+  official_data_only: true
+  allow_external_pretrained_weights: false
+  restricted_path_keys: [scoring_data]
+  allowed_commands: [audit-data, benchmark, discover-relations, backtest, doctor, train, tune, validate, predict, run]
+  training_period: ["2025-01-01 00:00:00", "2025-05-01 00:00:00"]
+  scoring_period: ["2025-05-01 00:00:00", "2025-05-02 23:45:00"]
+  note: "Pre 文件中的 2025-05-01 00:00:00 是官方提供的滚动预测参考时刻；评分标签不得进入训练、调参或模型选择，预测期仅按起点及之前的观测历史构造因果输入。"
+  scoring_history_points: 672
+
+data:
+  tables:
+    gas:
+      path: "Pre_gas.csv"
+    gas_holder:
+      path: "Pre_gas_holder.csv"
+      mappings:
+        blast_furnace_gas_holder_1:
+          sources: []
+          patterns: ["^blast_furnace_gas_holder_\\d+$"]
+          combine: sum
+          required: true
+        coke_oven_gas_holder_1:
+          required: false
+        converter_gas_holder_1:
+          required: false
+    gas_user:
+      path: "Pre_gas_user.csv"
+      mappings:
+        coke_oven_user1:
+          required: false
+    load:
+      path: "Pre_load.csv"
+    price:
+      path: "price.xlsx"
+      time_series: false
+    audit_scenarios:
+      required: false
+
+forecast:
+  short_steps: 8
+  model:
+    type: last_value
+    clip_min: null
+    components: []
+  prediction_origins:
+    mode: scoring
+    count: null
+    file: null
+  deep_learning:
+    search_enabled: false
+    architectures: [tcn, patchtst]
+    context_candidates: [192, 384, 672]
+    coarse_folds: 4
+    coarse_epochs: 60
+    search_top_k: 2
+
+# 只使用训练期滚动验证进行模型决策；8 折覆盖不同月份和生产阶段。
+validation:
+  mode: expanding
+  folds: 8
+  initial_train_points: 3840
+  validation_points: 192
+  step_points: 1056
+  rolling_train_points: 3840
+
+recent_validation:
+  folds: 10
+  validation_points: 192
+  step_points: 192
+  rolling_train_points: null
+
+optuna:
+  n_trials: 30
+  top_k: 5
+
+submission:
+  stage: preliminary
+
+# 评分期文件只作为逐起点预测输入，不读取未来标签或计算本地测试成绩。
+prediction_input:
+  table_paths:
+    gas: "Pre_test_gas.csv"
+    gas_holder: "Pre_test_gas_holder.csv"
+    gas_user: "Pre_test_gas_user.csv"
+    load: "Pre_test_load.csv"

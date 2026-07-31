@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Iterable, Mapping, MutableMapping
+from typing import Any, Callable, Iterable, Mapping, MutableMapping
 
 import numpy as np
 import pandas as pd
@@ -76,7 +76,16 @@ class CausalFeatureBuilder:
             usage, pd.Timestamp("2000-01-01"), self.interval_minutes
         ) is None
 
-    def transform(self, frame: pd.DataFrame) -> pd.DataFrame:
+    def progress_steps(self) -> int:
+        """返回特征构建可汇报的工作项数量。"""
+
+        return len(_flatten_role_columns(self.roles)) + 5
+
+    def transform(
+        self,
+        frame: pd.DataFrame,
+        progress_callback: Callable[[str], None] | None = None,
+    ) -> pd.DataFrame:
         if not isinstance(frame.index, pd.DatetimeIndex):
             raise TypeError("特征输入索引必须是 DatetimeIndex")
         if not frame.index.is_monotonic_increasing or not frame.index.is_unique:
@@ -84,14 +93,31 @@ class CausalFeatureBuilder:
 
         feature_values: dict[str, Any] = {}
         self._add_time_features(frame.index, feature_values)
-        base_columns = [column for column in _flatten_role_columns(self.roles) if column in frame]
+        if progress_callback is not None:
+            progress_callback("构建时间特征")
+        configured_columns = _flatten_role_columns(self.roles)
+        base_columns = [column for column in configured_columns if column in frame]
         self._add_missing_features(frame, feature_values, base_columns)
-        self._add_lag_and_rolling_features(frame, feature_values, base_columns)
+        if progress_callback is not None:
+            progress_callback("构建缺失标记")
+        self._add_lag_and_rolling_features(
+            frame,
+            feature_values,
+            configured_columns,
+            progress_callback=progress_callback,
+        )
         self._add_gas_features(frame, feature_values)
+        if progress_callback is not None:
+            progress_callback("构建煤气平衡特征")
         self._add_operating_features(frame, feature_values)
+        if progress_callback is not None:
+            progress_callback("构建机组状态特征")
         # 一次性组装宽表，避免真实数据上逐列 insert 导致内存碎片。
         result = pd.DataFrame(feature_values, index=frame.index)
-        return result.replace([np.inf, -np.inf], np.nan)
+        result = result.replace([np.inf, -np.inf], np.nan)
+        if progress_callback is not None:
+            progress_callback("组装特征表")
+        return result
 
     def _add_time_features(
         self,
@@ -125,19 +151,40 @@ class CausalFeatureBuilder:
                 result[existing] = frame[column].isna().astype(np.int8)
         if "feat_time_gap_inserted" in frame:
             result["feat_time_gap_inserted"] = frame["feat_time_gap_inserted"].astype(np.int8)
+        # 清洗层生成的缺失连续长度、异常标记和稳健值均已是因果特征。
+        for column in frame.columns:
+            name = str(column)
+            if name.startswith(("feat_missing_run__", "feat_outlier__", "feat_robust__")):
+                source_name = name.split("__", 1)[-1]
+                if self._source_allowed(source_name, 0, name):
+                    result[name] = pd.to_numeric(frame[column], errors="coerce")
 
     def _add_lag_and_rolling_features(
         self,
         frame: pd.DataFrame,
         result: MutableMapping[str, Any],
         base_columns: Iterable[str],
+        progress_callback: Callable[[str], None] | None = None,
     ) -> None:
         lag_steps = [int(value) for value in self.feature_config.get("lag_steps", [])]
         windows = [int(value) for value in self.feature_config.get("rolling_windows", [])]
         statistics = {str(value) for value in self.feature_config.get("rolling_statistics", [])}
 
         for column in base_columns:
+            if column not in frame:
+                if progress_callback is not None:
+                    progress_callback(f"跳过缺失字段 {column}")
+                continue
             series = pd.to_numeric(frame[column], errors="coerce")
+            current_name = f"feat_current_{column}"
+            if self._source_allowed(column, 0, current_name):
+                result[current_name] = series
+                result[f"feat_diff_{column}_1"] = series.diff(1)
+                result[f"feat_diff_{column}_4"] = series.diff(4)
+                result[f"feat_accel_{column}"] = series.diff(1).diff(1)
+                result[f"feat_ewma_{column}_8"] = series.ewm(
+                    span=8, adjust=False, min_periods=2
+                ).mean()
             for lag in lag_steps:
                 feature_name = f"feat_lag_{column}_{lag}"
                 if self._source_allowed(column, lag, feature_name):
@@ -146,6 +193,8 @@ class CausalFeatureBuilder:
             # 这一行是泄漏控制核心：当前值先移出窗口，统计量只看 t-1 及更早数据。
             shifted = series.shift(1)
             if not self._source_allowed(column, 1, f"feat_roll_{column}"):
+                if progress_callback is not None:
+                    progress_callback(f"跳过不可用字段 {column}")
                 continue
             for window in windows:
                 minimum = max(2, window // 2)
@@ -161,6 +210,13 @@ class CausalFeatureBuilder:
                     result[f"{prefix}_max"] = rolling.max()
                 if "slope" in statistics:
                     result[f"{prefix}_slope"] = rolling.apply(_rolling_slope, raw=True)
+                if "quantile" in statistics or bool(
+                    self.feature_config.get("rolling_quantiles", False)
+                ):
+                    result[f"{prefix}_q10"] = rolling.quantile(0.10)
+                    result[f"{prefix}_q90"] = rolling.quantile(0.90)
+            if progress_callback is not None:
+                progress_callback(f"构建字段特征 {column}")
 
     def _add_gas_features(
         self, frame: pd.DataFrame, result: MutableMapping[str, Any]
@@ -202,6 +258,29 @@ class CausalFeatureBuilder:
                         frame[holder_column].shift(1).diff() / float(self.interval_minutes)
                     )
 
+        production_series, _ = _sum_role_series(frame, production)
+        demand_series, _ = _sum_role_series(frame, demand)
+        process_series, _ = _sum_role_series(frame, process_demand)
+        generator_use = self.roles.get("generator_gas_use", {})
+        use_series, _ = _sum_role_series(frame, generator_use)
+        for name, series in (
+            ("feat_gas_total_production", production_series),
+            ("feat_gas_total_demand", demand_series),
+            ("feat_gas_total_process_demand", process_series),
+            ("feat_gas_total_use", use_series),
+        ):
+            if series is not None:
+                result[name] = series.shift(1)
+        if production_series is not None and demand_series is not None:
+            process_term = process_series if process_series is not None else 0.0
+            result["feat_gas_total_balance"] = (
+                production_series - demand_series - process_term
+            ).shift(1)
+        if use_series is not None and production_series is not None:
+            result["feat_gas_use_to_production_ratio"] = (
+                use_series / production_series.replace(0.0, np.nan)
+            ).shift(1)
+
     def _add_operating_features(
         self, frame: pd.DataFrame, result: MutableMapping[str, Any]
     ) -> None:
@@ -225,6 +304,15 @@ class CausalFeatureBuilder:
             result[f"feat_state_{target_name}_ramp_up"] = (delta > stable_threshold).astype(np.int8)
             result[f"feat_state_{target_name}_ramp_down"] = (delta < -stable_threshold).astype(np.int8)
             result[f"feat_state_{target_name}_ramp_rate"] = delta / float(self.interval_minutes)
+
+        if {"generator_1", "generator_all"}.issubset(frame.columns):
+            one = pd.to_numeric(frame["generator_1"], errors="coerce")
+            total = pd.to_numeric(frame["generator_all"], errors="coerce")
+            extra = total - one
+            result["feat_generator_extra_load"] = extra
+            result["feat_generator_extra_ratio"] = one / total.replace(0.0, np.nan)
+            result["feat_generator_target_gap"] = total - one
+            result["feat_generator_target_consistent"] = (total >= one).astype(np.int8)
 
 
 def assert_feature_causality(

@@ -20,11 +20,12 @@ def configure_logging(log_dir: Path, level: str = "INFO", filename: str = "pipel
     logger.setLevel(getattr(logging, level.upper(), logging.INFO))
     logger.handlers.clear()
 
-    formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+    file_formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+    console_formatter = logging.Formatter("%(message)s")
     file_handler = logging.FileHandler(log_dir / filename, encoding="utf-8")
-    file_handler.setFormatter(formatter)
+    file_handler.setFormatter(file_formatter)
     stream_handler = logging.StreamHandler()
-    stream_handler.setFormatter(formatter)
+    stream_handler.setFormatter(console_formatter)
     logger.addHandler(file_handler)
     logger.addHandler(stream_handler)
     return logger

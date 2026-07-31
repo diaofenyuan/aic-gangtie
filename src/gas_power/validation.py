@@ -87,6 +87,57 @@ class TimeSeriesRollingSplitter:
             raise LeakageError("训练区间与验证起点重叠")
 
 
+class RecentWindowSplitter:
+    """从训练尾部向前构造互不重叠的完整两天验证折。"""
+
+    def __init__(
+        self,
+        folds: int = 10,
+        validation_points: int = 192,
+        step_points: int = 192,
+        rolling_train_points: int | None = None,
+    ):
+        self.folds = int(folds)
+        self.validation_points = int(validation_points)
+        self.step_points = int(step_points)
+        self.rolling_train_points = (
+            int(rolling_train_points) if rolling_train_points is not None else None
+        )
+        if min(self.folds, self.validation_points, self.step_points) <= 0:
+            raise ValueError("最近窗口验证器各点数配置必须大于 0")
+
+    def split(self, index: pd.DatetimeIndex, max_horizon: int) -> list[TimeSplit]:
+        if not index.is_monotonic_increasing or not index.is_unique:
+            raise ValueError("最近窗口验证索引必须严格递增且唯一")
+        latest_end = len(index) - int(max_horizon) - 1
+        starts = [
+            latest_end - self.validation_points + 1 - offset * self.step_points
+            for offset in reversed(range(self.folds))
+        ]
+        splits: list[TimeSplit] = []
+        for fold, validation_start in enumerate(starts):
+            validation_end = validation_start + self.validation_points - 1
+            train_end_position = validation_start - 1
+            if validation_start <= 0 or validation_end > latest_end:
+                raise ValueError("数据长度不足以生成完整的最近两天验证折")
+            train_start_position = 0
+            if self.rolling_train_points is not None:
+                train_start_position = max(
+                    0, train_end_position - self.rolling_train_points + 1
+                )
+            split = TimeSplit(
+                fold=fold,
+                train_start=pd.Timestamp(index[train_start_position]),
+                train_end=pd.Timestamp(index[train_end_position]),
+                validation_origins=pd.DatetimeIndex(
+                    index[validation_start : validation_end + 1]
+                ),
+            )
+            TimeSeriesRollingSplitter._assert_order(split)
+            splits.append(split)
+        return splits
+
+
 @dataclass
 class ValidationArtifacts:
     metrics: pd.DataFrame
@@ -140,11 +191,26 @@ def run_rolling_validation(
     feature_builder: CausalFeatureBuilder | None = None,
     show_progress: bool = False,
     progress_description: str = "滚动验证",
+    raw_targets: pd.DataFrame | None = None,
+    feature_matrix: pd.DataFrame | None = None,
+    data_source: str = "training",
 ) -> ValidationArtifacts:
+    if data_source == "scoring":
+        raise LeakageError("评分期 scoring 数据禁止用于滚动验证或模型选择")
     horizons = [int(value) for value in horizons]
     splits = splitter.split(frame.index, max(horizons))
+    labels = frame[list(target_columns)] if raw_targets is None else raw_targets
+    missing_label_columns = set(map(str, target_columns)).difference(labels.columns)
+    if missing_label_columns:
+        raise ValueError(f"原始标签缺少目标字段: {sorted(missing_label_columns)}")
     condition_features = (
-        feature_builder.transform(frame) if feature_builder is not None else pd.DataFrame(index=frame.index)
+        feature_matrix.reindex(frame.index)
+        if feature_matrix is not None
+        else (
+            feature_builder.transform(frame)
+            if feature_builder is not None
+            else pd.DataFrame(index=frame.index)
+        )
     )
     condition_columns = [
         column
@@ -170,7 +236,38 @@ def run_rolling_validation(
     for split in split_iterator:
         model = model_factory()
         training = frame.loc[split.train_start : split.train_end]
-        model.fit(training, target_columns, horizons, train_end=split.train_end)
+        fit_steps = model.fit_progress_steps(target_columns, horizons)
+        fit_progress = tqdm(
+            total=fit_steps,
+            desc=f"{progress_description} 第 {split.fold + 1}/{len(splits)} 折训练",
+            unit="步",
+            dynamic_ncols=True,
+            leave=False,
+            disable=not show_progress or fit_steps is None,
+        )
+
+        def advance_fit(label: str) -> None:
+            fit_progress.set_postfix_str(label, refresh=False)
+            fit_progress.update(1)
+
+        model.set_fit_progress_callback(advance_fit if show_progress else None)
+        try:
+            model.fit(
+                training,
+                target_columns,
+                horizons,
+                train_end=split.train_end,
+                raw_targets=labels.loc[split.train_start : split.train_end],
+                feature_matrix=(
+                    condition_features.loc[training.index]
+                    if feature_matrix is not None
+                    else None
+                ),
+                data_source=data_source,
+            )
+        finally:
+            model.set_fit_progress_callback(None)
+            fit_progress.close()
         predictions = model.predict(frame, split.validation_origins, target_columns, horizons)
         if split.fold == 0:
             assert_model_causality(
@@ -195,7 +292,7 @@ def run_rolling_validation(
                         "target": str(target),
                         "horizon_steps": horizon,
                         "horizon_minutes": horizon * interval_minutes,
-                        "y_true": frame.at[target_time, str(target)],
+                        "y_true": labels.at[target_time, str(target)],
                         "y_pred": predictions.at[
                             origin,
                             prediction_column(str(target), horizon, interval_minutes),
@@ -333,8 +430,20 @@ def summarize_detailed_validation(
 
 
 def splitter_from_config(config: Mapping[str, object]) -> TimeSeriesRollingSplitter:
+    mode = str(config.get("mode", "expanding"))
+    if mode == "recent":
+        return RecentWindowSplitter(
+            folds=int(config.get("folds", 10)),
+            validation_points=int(config.get("validation_points", 192)),
+            step_points=int(config.get("step_points", 192)),
+            rolling_train_points=(
+                int(config["rolling_train_points"])
+                if config.get("rolling_train_points") is not None
+                else None
+            ),
+        )  # type: ignore[return-value]
     return TimeSeriesRollingSplitter(
-        mode=str(config.get("mode", "expanding")),
+        mode=mode,
         folds=int(config.get("folds", 2)),
         initial_train_points=int(config.get("initial_train_points", 1152)),
         validation_points=int(config.get("validation_points", 96)),

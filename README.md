@@ -1,8 +1,8 @@
 # 煤气发电量预测与发电优化
 
-这是面向“全球校园人工智能算法精英大赛·AI+钢铁·煤气发电预测与发电优化”的第一版离线工程。当前没有正式数据，默认配置使用独立合成数据验证代码链路。
+这是面向“全球校园人工智能算法精英大赛·AI+钢铁·煤气发电预测与发电优化”的离线工程。项目已接入初赛正式数据，默认入口使用隔离的初赛配置；合成数据仅用于验证代码链路。
 
-> **重要：合成数据只能测试读取、清洗、特征、训练、验证、预测、文件生成和优化流程，不能用于判断真实准确率、模型优劣、经济收益或竞赛成绩。** 项目没有训练正式模型，也没有报告正式验证成绩。
+> **重要：合成数据只能测试读取、清洗、特征、训练、验证、预测、文件生成和优化流程，不能用于判断真实准确率、模型优劣、经济收益或竞赛成绩。** 正式模型必须通过训练期原始标签验证和门控后才会写入 `models/`。
 
 ## 环境与安装
 
@@ -21,14 +21,15 @@ uv pip install --python .venv/Scripts/python.exe -r requirements.txt   # Windows
 uv pip install --python .venv/bin/python -r requirements.txt           # Linux
 ```
 
-LightGBM 与 CatBoost 是可选依赖，默认基线不要求安装：
+LightGBM、CatBoost、Optuna 和 PyTorch 是高精度流程的可选依赖，默认基线不要求安装：
 
 ```bash
 python -m pip install ".[lightgbm]"
 python -m pip install ".[catboost]"
+python -m pip install ".[high-accuracy]"
 ```
 
-正式离线环境应提前下载对应 Python 3.10 wheel。若国内网络下载受限，可在联网准备环境中使用清华 PyPI 镜像，然后把 wheel 和项目一起带入离线环境。
+正式离线环境应提前下载对应 Python 3.10 wheel。若国内网络下载受限，可在联网准备环境中使用清华或阿里云镜像，然后把 wheel 和项目一起带入离线环境。`doctor` 会报告 LightGBM、CatBoost、Optuna、PyTorch 和 CUDA 是否可用。
 
 ## 一键运行
 
@@ -38,16 +39,24 @@ python -m pip install ".[catboost]"
 python run.py
 ```
 
-该命令默认读取 `config/default.yaml` 和 `data` 目录中的现有数据，依次训练默认基线、执行滚动验证、生成短/长周期结果并运行优化，不会自动生成或覆盖输入数据。运行过程使用 `tqdm` 显示总任务、完整流程、数据准备和验证进度，默认按 `runtime.workers: 16` 使用 16 个逻辑处理器。
+该命令默认读取 `config/official_preliminary.yaml`，初赛会依次执行训练期高精度搜索/门控、原始标签滚动验证，并为评分期生成 192 个短周期预测起点；未通过门控时自动使用最后值回退。`input.csv` 和 `s_result.csv` 写完后记录 SHA-256 冻结清单。运行流程不读取未来标签，也不计算测试集成绩。终端默认只显示中文运行摘要，完整结果保存在本次输出目录的 `运行结果.json`，详细报告保存在 `reports` 中。
+
+训练目录和评分目录已经隔离；也可以显式指定初赛正式配置来执行单个阶段：
+
+```bash
+.venv/Scripts/python.exe run.py --config config/official_preliminary.yaml audit-data
+```
+
+`paths.data` 指向项目内的 `data/preliminary/train`；`paths.scoring_data` 指向隔离存放的 `data/preliminary/scoring`，只在预测期作为逐起点历史输入。评分目录不会进入模型拟合、训练期模型选择或本地评分。该配置只允许初赛相关命令，并明确禁止联网推理、外部数据和外部预训练权重。
 
 每次命令的结果都会写入独立目录。运行期间先使用 `outputs` 下的临时目录，任务结束后按结束时刻重命名，目录名只由“结束时间 + 预测结果”组成，例如：
 
 ```text
 outputs/2026-07-31_02-10-30预测结果/
 ├── s_result.csv
-├── l_result.csv
 ├── input.csv
-├── opt_result.csv
+├── submission_freeze.json        # 提交文件 SHA-256 冻结清单
+├── 运行结果.json                 # 终端摘要对应的完整结构化结果
 ├── 提交压缩包.zip               # ZIP 根目录仅包含 input.csv 和 s_result.csv
 └── reports/
 ```
@@ -57,8 +66,11 @@ outputs/2026-07-31_02-10-30预测结果/
 ```bash
 python run.py --workers 8
 python run.py --no-progress
+python run.py --no-progress --json
 python run.py --config config/default.yaml --workers 16 demo
 ```
+
+默认终端输出适合人工阅读；需要完整 JSON 标准输出供脚本处理时使用 `--json`，通常与 `--no-progress` 一起使用。
 
 `demo` 会把合成数据放入 `data/synthetic`，与 `data` 根目录中的正式数据隔离。
 
@@ -67,6 +79,8 @@ python run.py --config config/default.yaml --workers 16 demo
 ```bash
 python run.py --config config/default.yaml generate-synthetic
 python run.py --config config/default.yaml train
+python run.py --config config/official_preliminary.yaml doctor
+python run.py --config config/official_preliminary.yaml tune
 python run.py --config config/default.yaml validate
 python run.py --config config/default.yaml audit-data
 python run.py --config config/default.yaml benchmark
@@ -133,9 +147,9 @@ python -m src.cli --config config/default.yaml benchmark
 
 对于 PDF 中不带时间戳的月度 `price.xlsx`，将对应表设为 `time_series: false`，避免参与 15 分钟对齐；待官方表结构到达后再把月份、时段和单价映射到优化时域。
 
-正式数据尚未提供，因此 `config/default.yaml` 中各表的 `aggregation: mean` 只是流程占位。数据到达后必须根据 `data_dictionary.xlsx` 逐字段决定 `mean`、`sum` 或 `last`，尤其不能把区间累计量误按均值聚合。
+初赛正式数据已经通过 `config/official_preliminary.yaml` 接入；`config/default.yaml` 继续保留为合成流程和通用基线配置。正式配置按字段字典汇总多座高炉、热风炉、煤气用户和气柜，不会将评分集作为训练输入。
 
-默认清洗只使用历史滚动 IQR 和有限长度前向填补。项目刻意不使用后向填补或双向插值，因为全表预处理时它们可能把未来观测带到预测起点之前。
+清洗保留所有有限原始观测；滚动 IQR 只生成 `feat_outlier__*` 和稳健缩放特征，不会平滑或替换标签。缺失值最多因果前向填补 8 点，整列缺失填 0 并保留 `feat_missing__*` 标记。项目刻意不使用后向填补或双向插值，因为全表预处理时它们可能把未来观测带到预测起点之前。训练、验证和 MAPE 始终使用未修改的 `Pre_load.csv` 原始标签。
 
 ## 预测实现
 
@@ -157,11 +171,15 @@ python -m src.cli --config config/default.yaml benchmark
 - `target_mode: delta`：默认预测未来相对当前负荷的变化量；
 - `target_mode: absolute`：直接预测未来绝对负荷。
 
-`ForecastModel` 是统一接口，后续 PyTorch 时序模型实现同一 `fit/predict` 契约即可，不会强制引入 GPU 或预训练权重。
+`ForecastModel` 是统一接口。高精度配置下，LightGBM/CatBoost direct 残差模型、组件重建模型以及从零训练的 TCN/PatchTST 共用 `fit/predict` 契约；深度模型使用 RobustScaler、SmoothL1+MAPE 混合损失、多随机种子和早停，不使用外部预训练权重。
 
-`residual_lightgbm` 与 `residual_catboost` 实现“基线预测 + 残差预测”。残差模型支持 direct/global 两种多步策略；最终 `train/predict` 前必须存在当前运行目录的 `outputs/<完成时间>预测结果/reports/residual_gate.json`，且全部时间折达到配置改善阈值。验证或测试标签不能用于单样本融合权重。
+`residual_lightgbm` 与 `residual_catboost` 实现“基线预测 + 残差预测”。残差模型支持 direct/global 两种多步策略；最终 `train/predict` 前必须存在当前运行目录的 `outputs/<完成时间>预测结果/reports/residual_gate.json`，且全部时间折达到配置改善阈值。验证标签不能用于单样本融合权重。
 
 物理后处理支持非负、容量、可配置逐步爬坡及 `generator_1 <= generator_all`。回测会把约束前后指标分别写入本次运行的 `outputs/<完成时间>预测结果/reports/postprocessing_metrics.csv`，不默认假设约束一定改善准确率。
+
+`tune` 只读取训练目录，先用最近 4 折 Optuna 粗筛，再对树模型前 5 组和深度模型前 2 组执行 10 个最近两天折及 8 个跨月份折。选择指标为最近折平均/最差和跨月份平均的加权组合；候选必须在原始标签上平均改善至少 0.3 个百分点、两个目标均不退化、至少 7/10 折改善且最差折退化不超过 0.5 个百分点。未通过的候选不会进入 OOF 融合，最终自动回退到 `LastValueModel`。融合权重按目标×步长使用非负 NNLS，并以留一折预测重新门控。
+
+`scoring` 不是验证集。它只能在 `predict` 阶段按起点拼接训练尾部 672 点历史；评分期后续行不会进入拟合、OOF、早停、特征选择或融合调权。`reports/high_accuracy_selection.json`、模型元数据和 SHA-256 清单记录这一边界。
 
 ## 防止未来信息泄露
 
@@ -209,21 +227,20 @@ python -m src.cli --config config/default.yaml benchmark
 ## 输出文件
 
 - `outputs/<完成时间>预测结果/s_result.csv`：`datetime` + 两个目标的 t+15 至 t+120，共 17 列；
-- `outputs/<完成时间>预测结果/l_result.csv`：`datetime` + 两个目标的 t+15 至 t+1440，共 193 列；
-- `outputs/<完成时间>预测结果/opt_result.csv`：`datetime` + 三类带 `opt_` 前缀的发电耗气字段；
-- `outputs/<完成时间>预测结果/input.csv`：预测起点对应的标准字段和所有 `feat_` 特征；
+- `outputs/<完成时间>预测结果/input.csv`：192 个预测起点、29 个官方原始字段及所有 `feat_` 因果派生特征；
 - `outputs/<完成时间>预测结果/提交压缩包.zip`：ZIP 根目录仅包含原名 `input.csv` 和 `s_result.csv`；
+- `outputs/<完成时间>预测结果/submission_freeze.json`：两个提交文件的 SHA-256 与字节数；
 - `outputs/<完成时间>预测结果/reports/resource_boundary_forecast.csv`：三类煤气发生量、优先需求、储气前可用量、历史发电基准和电价的 96 步预测；
 - `outputs/<完成时间>预测结果/reports/inference_runtime.json`：单样本和总推理耗时，并检查题面建议的单样本 30 秒、总计 30 分钟限制；
 - `outputs/<完成时间>预测结果/submission_manifest.json`：源码/config 哈希、模型训练区间、字段白名单、文件哈希与校验结果。
 
-写出前后都会检查时间戳是否为预测起点、列名及顺序、步长完整性、目标互换、缺行/重复/错位、意外索引列、数值类型、缺失/无穷值、容量边界和 UTF-8 编码。`input.csv` 只保留正式白名单源字段和因果特征，不再导出诊断字段。
+写出前后都会检查时间戳是否为预测起点、列名及顺序、步长完整性、目标互换、缺行/重复/错位、意外索引列、数值类型、缺失/无穷值、容量边界和 UTF-8 编码。`input.csv` 保留 29 个官方原始字段，所有派生字段统一使用 `feat_` 前缀。ZIP 打包前会再次校验冻结哈希。
 
 提交压缩包按初赛截图要求固定打包 `input.csv` 和 `s_result.csv`，文件名保持不变且不增加额外目录层级。
 
-## GPU 实验门控
+## GPU 与深度模型
 
-当前不需要 GPU。默认先完成 CPU 强基线和 LightGBM/CatBoost，只有它们在严格时间验证中形成稳定瓶颈后才考虑 TCN、PatchTST。`gpu.enabled` 默认关闭；即使打开，也必须满足 `gpu_gate.json` 中所有时间折增益不低于配置阈值。优化模型始终使用 CPU HiGHS。
+高精度初赛配置默认搜索 TCN/PatchTST，但只有通过与树模型相同的原始标签稳定性门槛才会进入最终融合；无法使用 CUDA 时可切换 `forecast.deep_learning.device: cpu`，不会改变合规边界。优化模型始终使用 CPU HiGHS。
 
 ## 等待正式数据或规则确认
 
@@ -243,24 +260,22 @@ python -m src.cli --config config/default.yaml benchmark
 - 是否存在独立数据处理得分及其组合权重；
 - 优化输出的精确字段名、单位及预测资源边界接口。
 
-正式数据到达后，应先根据 `data_dictionary.xlsx` 和官方模板更新 YAML，再校验单位、物料平衡和提交列名；不得直接把合成占位参数用于正式优化。
+当前只处理初赛短周期预测，不运行发电优化。初赛提交压缩包固定只包含 `input.csv` 与 `s_result.csv`。
 
 建议首批执行顺序：
 
 ```bash
-python run.py --config config/official.yaml audit-data
-python run.py --config config/official.yaml benchmark
-python run.py --config config/official.yaml discover-relations
-python run.py --config config/official.yaml backtest
-python run.py --config config/official.yaml train
-python run.py --config config/official.yaml predict
-python run.py --config config/official.yaml optimize
-python run.py --config config/official.yaml validate-submission
+.venv/Scripts/python.exe run.py --config config/official_preliminary.yaml audit-data
+.venv/Scripts/python.exe run.py --config config/official_preliminary.yaml benchmark
+.venv/Scripts/python.exe run.py --config config/official_preliminary.yaml discover-relations
+.venv/Scripts/python.exe run.py --config config/official_preliminary.yaml backtest
+.venv/Scripts/python.exe run.py --config config/official_preliminary.yaml train
+.venv/Scripts/python.exe run.py --config config/official_preliminary.yaml predict
 ```
 
 ## 当前验收说明
 
-2026-07-31 已在本机隔离的 CPython 3.10.20 环境实际完成以下验收：
+2026-07-31 已在本机隔离的 CPython 3.10 环境完成以下高精度链路验收：
 
 ```text
 python run.py --config config/default.yaml generate-synthetic 通过，2016 个干净时间点
@@ -274,7 +289,7 @@ python run.py --config config/default.yaml predict             通过，生成�
 python run.py --config config/default.yaml optimize            通过，HiGHS Optimal；最大约束违反量 2.27e-9
 python run.py --config config/default.yaml validate-submission 通过，联合提交校验和 manifest 校验通过
 python -m compileall -q src tests run.py                       通过
-python -m pytest                                               28 passed
+python -m pytest                                               45 passed
 ruff check src tests run.py                                    All checks passed
 ```
 
@@ -288,4 +303,4 @@ ruff check src tests run.py                                    All checks passed
 - `input.csv` 仅含白名单输入和工程特征；
 - HiGHS 返回 `Optimal`，最大约束违反量为 `2.27e-9`，合成流程中供气不足和放散均为 0。
 
-以上仅是代码流程、约束和文件格式验收。README 不列出合成数据 MAPE/1-MAPE 数值，也不将其解释为正式成绩。
+以上合成流程仅是代码、约束和文件格式验收，不代表正式成绩。正式初赛应先执行 `doctor`，再执行 `tune`；只有 `high_accuracy_selection.json` 显示门控通过时才使用机器学习融合，否则使用可审计的最后值回退。一次官方数据单折冒烟中，30 棵树的直接 LightGBM 原始标签 MAPE 为 6.0753%，同折最后值为 6.3520%；该结果不是完整 10 折/8 折选择结论，也不代表排行榜成绩。

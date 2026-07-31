@@ -93,12 +93,17 @@ def test_boosting_supports_direct_and_global_multistep_strategies() -> None:
             target_mode=target_mode,
             feature_builder=builder,
         )
+        progress_updates: list[str] = []
+        model.set_fit_progress_callback(progress_updates.append)
         model.fit(
             frame.iloc[:350],
             ["generator_1"],
             [1, 2],
             train_end=frame.index[349],
         )
+        expected_steps = 2 if strategy == "direct" else 1
+        assert model.fit_progress_steps(["generator_1"], [1, 2]) == expected_steps
+        assert len(progress_updates) == expected_steps
         prediction = model.predict(frame, origins, ["generator_1"], [1, 2])
         assert prediction.shape == (2, 2)
         assert np.isfinite(prediction.to_numpy()).all()

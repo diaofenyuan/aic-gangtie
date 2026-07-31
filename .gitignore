@@ -10,7 +10,7 @@ __pycache__/
 data/
 cache/
 logs/
-models/
+/models/
 outputs/
 reports/
 tmp/

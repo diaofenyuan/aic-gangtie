@@ -6,7 +6,7 @@ import json
 import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 import numpy as np
 import pandas as pd
@@ -16,6 +16,47 @@ from gas_power.config import ConfigError, ProjectConfig
 
 class DataError(ValueError):
     """输入数据无法按配置安全处理。"""
+
+
+@dataclass(frozen=True)
+class PreparedForecastData:
+    """将原始标签、模型输入和质量标记显式隔离的数据契约。"""
+
+    model_input: pd.DataFrame
+    raw_targets: pd.DataFrame
+    raw_observations: pd.DataFrame
+    missing_flags: pd.DataFrame
+    anomaly_flags: pd.DataFrame
+    label_valid_mask: pd.DataFrame
+    source: str = "training"
+
+    def __post_init__(self) -> None:
+        indexes = {
+            tuple(frame.index)
+            for frame in (
+                self.model_input,
+                self.raw_targets,
+                self.raw_observations,
+                self.missing_flags,
+                self.anomaly_flags,
+                self.label_valid_mask,
+            )
+        }
+        if len(indexes) != 1:
+            raise DataError("PreparedForecastData 的各数据区必须使用同一时间索引")
+        if self.source not in {"training", "scoring", "synthetic"}:
+            raise DataError(f"未知数据来源: {self.source}")
+
+    def assert_training_allowed(self) -> None:
+        """评分期数据只能用于逐起点推理，不能进入任何拟合或调参过程。"""
+
+        if self.source == "scoring":
+            raise DataError("评分期 scoring 数据禁止用于拟合、OOF、早停、特征选择或融合调权")
+
+    def targets_copy(self) -> pd.DataFrame:
+        """返回原始标签副本，避免调用方原地修改权威标签。"""
+
+        return self.raw_targets.copy(deep=True)
 
 
 @dataclass
@@ -62,6 +103,54 @@ def _read_table(path: Path) -> pd.DataFrame:
     if suffix == ".parquet":
         return pd.read_parquet(path)
     raise DataError(f"暂不支持的数据文件类型: {path}")
+
+
+def load_original_input_frame(
+    config: ProjectConfig,
+    directory: Path,
+    table_paths: Mapping[str, Any],
+) -> pd.DataFrame:
+    """按官方原名拼接评分期输入表，不用聚合字段替代原始字段。"""
+
+    data_config = config.section("data")
+    timestamp_format = data_config.get("timestamp_format")
+    frames: list[pd.DataFrame] = []
+    used_columns: set[str] = set()
+    for table_name, table_config in data_config["tables"].items():
+        if table_name not in table_paths:
+            continue
+        if not isinstance(table_config, Mapping):
+            raise ConfigError(f"data.tables.{table_name} 必须是字典")
+        path = Path(directory) / str(table_paths[table_name])
+        if not path.is_file():
+            raise DataError(f"评分输入表不存在: {path}")
+        raw = _read_table(path)
+        timestamp_column = str(table_config.get("timestamp", "datetime"))
+        if timestamp_column not in raw:
+            raise DataError(f"{path.name} 缺少时间戳字段 {timestamp_column}")
+        parsed = pd.to_datetime(
+            raw[timestamp_column],
+            format=str(timestamp_format) if timestamp_format else None,
+            errors="coerce",
+        )
+        if parsed.isna().any():
+            raise DataError(f"{path.name} 包含无效时间戳")
+        frame = raw.drop(columns=[timestamp_column]).copy()
+        frame.index = pd.DatetimeIndex(parsed, name="datetime")
+        if not frame.index.is_unique:
+            raise DataError(f"{path.name} 包含重复时间戳，无法保留原始输入行")
+        duplicate_columns = used_columns.intersection(str(column) for column in frame.columns)
+        if duplicate_columns:
+            raise DataError(f"评分输入表包含重复原始字段: {sorted(duplicate_columns)}")
+        used_columns.update(str(column) for column in frame.columns)
+        frames.append(frame)
+
+    if not frames:
+        raise DataError("没有可用于 input.csv 的评分输入表")
+    combined = pd.concat(frames, axis=1, join="outer").sort_index()
+    if not combined.index.is_unique:
+        raise DataError("评分输入拼接后时间戳不唯一")
+    return combined
 
 
 def _resolve_sources(columns: Iterable[str], mapping: Mapping[str, Any]) -> list[str]:
@@ -113,7 +202,26 @@ class ConfiguredDataLoader:
         self.data_config = config.section("data")
         self.preprocessing = config.section("preprocessing")
 
-    def load(self) -> tuple[pd.DataFrame, DataQualityReport]:
+    def progress_steps(self) -> int:
+        """返回完整加载流程可汇报的工作项数量。"""
+
+        return len(self.data_config["tables"]) + 3
+
+    def load(
+        self,
+        progress_callback: Callable[[str], None] | None = None,
+    ) -> tuple[pd.DataFrame, DataQualityReport]:
+        """兼容旧接口；新训练和验证代码应优先使用 ``load_prepared``。"""
+
+        prepared, report = self.load_prepared(progress_callback=progress_callback)
+        return prepared.model_input.copy(deep=True), report
+
+    def load_prepared(
+        self,
+        progress_callback: Callable[[str], None] | None = None,
+        *,
+        source: str = "training",
+    ) -> tuple[PreparedForecastData, DataQualityReport]:
         table_frames: list[pd.DataFrame] = []
         table_indexes: list[pd.DatetimeIndex] = []
         report = DataQualityReport()
@@ -126,6 +234,8 @@ class ConfiguredDataLoader:
             if not table_path.exists():
                 if required_table:
                     raise DataError(f"必需数据表不存在: {table_path}")
+                if progress_callback is not None:
+                    progress_callback(f"跳过可选表 {table_name}")
                 continue
 
             mapped, quality = self._load_one_table(table_path, table_config)
@@ -136,6 +246,8 @@ class ConfiguredDataLoader:
             used_columns.update(str(column) for column in mapped.columns)
             table_frames.append(mapped)
             table_indexes.append(mapped.index)
+            if progress_callback is not None:
+                progress_callback(f"读取数据表 {table_name}")
 
         if not table_frames:
             raise DataError("没有成功读取任何数据表")
@@ -150,12 +262,38 @@ class ConfiguredDataLoader:
         aligned = aligned.reindex(full_index)
         aligned.index.name = "datetime"
         aligned["feat_time_gap_inserted"] = inserted.astype(np.int8)
+        if progress_callback is not None:
+            progress_callback("对齐时间索引")
 
         report.aligned_rows = len(aligned)
         report.inserted_time_points = int(inserted.sum())
+        targets = [str(column) for column in self.data_config["roles"]["targets"]]
+        raw_observations = aligned.copy(deep=True)
+        raw_targets = raw_observations.reindex(columns=targets).copy(deep=True)
         cleaned = clean_aligned_frame(aligned, self.preprocessing, report)
-        self._validate_targets(cleaned)
-        return cleaned, report
+        if progress_callback is not None:
+            progress_callback("异常处理与缺失填补")
+        self._validate_targets(raw_targets)
+        if progress_callback is not None:
+            progress_callback("校验预测目标")
+        missing_columns = [
+            str(column) for column in cleaned.columns if str(column).startswith("feat_missing__")
+        ]
+        anomaly_columns = [
+            str(column) for column in cleaned.columns if str(column).startswith("feat_outlier__")
+        ]
+        prepared = PreparedForecastData(
+            model_input=cleaned.copy(deep=True),
+            raw_targets=raw_targets,
+            raw_observations=raw_observations,
+            missing_flags=cleaned[missing_columns].copy(deep=True),
+            anomaly_flags=cleaned[anomaly_columns].copy(deep=True),
+            label_valid_mask=raw_targets.apply(
+                lambda column: np.isfinite(pd.to_numeric(column, errors="coerce"))
+            ).astype(bool),
+            source=source,
+        )
+        return prepared, report
 
     def _load_one_table(
         self, path: Path, table_config: Mapping[str, Any]
@@ -252,12 +390,21 @@ def clean_aligned_frame(
         indicator = f"feat_missing__{column}"
         if indicator not in cleaned.columns:
             cleaned[indicator] = cleaned[column].isna().astype(np.int8)
+        missing = cleaned[column].isna()
+        groups = (~missing).cumsum()
+        cleaned[f"feat_missing_run__{column}"] = (
+            missing.astype(np.int32).groupby(groups).cumsum().astype(np.int16)
+        )
 
-    outlier_counts = apply_causal_outlier_filter(
+    outlier_counts, outlier_features = apply_causal_outlier_filter(
         cleaned,
         numeric_columns,
         preprocessing.get("outliers", {}),
     )
+    cleaned = cleaned.drop(
+        columns=cleaned.columns.intersection(outlier_features.columns), errors="ignore"
+    )
+    cleaned = pd.concat([cleaned, outlier_features], axis=1).copy()
     imputation = preprocessing.get("imputation", {})
     method = str(imputation.get("method", "ffill"))
     limit_value = imputation.get("limit")
@@ -269,6 +416,11 @@ def clean_aligned_frame(
         pass
     else:
         raise ConfigError(f"仅支持因果填补方法 ffill/none，收到: {method}")
+
+    # 整列缺失没有可用历史，保留缺失标记并填零，避免模型矩阵出现空列。
+    entirely_missing = [column for column in numeric_columns if cleaned[column].isna().all()]
+    if entirely_missing:
+        cleaned.loc[:, entirely_missing] = 0.0
 
     if report is not None:
         report.outlier_counts = outlier_counts
@@ -283,18 +435,25 @@ def apply_causal_outlier_filter(
     frame: pd.DataFrame,
     columns: Iterable[str],
     config: Mapping[str, Any],
-) -> dict[str, int]:
-    """用历史窗口 IQR 检测异常；窗口先 shift，当前值不参与阈值计算。"""
+) -> tuple[dict[str, int], pd.DataFrame]:
+    """用历史窗口 IQR 标记异常，并生成模型专用稳健值，不覆盖原始观测。"""
 
     counts: dict[str, int] = {str(column): 0 for column in columns}
+    feature_values: dict[str, pd.Series] = {}
     if not bool(config.get("enabled", False)):
-        return counts
+        for column in columns:
+            series = pd.to_numeric(frame[column], errors="coerce")
+            feature_values[f"feat_outlier__{column}"] = pd.Series(
+                np.zeros(len(frame), dtype=np.int8), index=frame.index
+            )
+            feature_values[f"feat_robust__{column}"] = series
+        return counts, pd.DataFrame(feature_values, index=frame.index)
     window = int(config.get("window", 96))
     min_periods = int(config.get("min_periods", max(4, window // 4)))
     multiplier = float(config.get("iqr_multiplier", 4.0))
-    replace_with = str(config.get("replace_with", "median"))
-    if replace_with != "median":
-        raise ConfigError("当前异常替换接口仅支持历史窗口 median")
+    robust_with = str(config.get("robust_with", config.get("replace_with", "median")))
+    if robust_with != "median":
+        raise ConfigError("当前稳健特征仅支持使用历史窗口 median")
 
     for column in columns:
         series = pd.to_numeric(frame[column], errors="coerce")
@@ -309,8 +468,52 @@ def apply_causal_outlier_filter(
         valid_threshold = iqr.notna() & (iqr > 0)
         mask = valid_threshold & ((series < lower) | (series > upper))
         counts[str(column)] = int(mask.sum())
-        frame.loc[mask, column] = median.loc[mask]
-    return counts
+        feature_values[f"feat_outlier__{column}"] = mask.astype(np.int8)
+        robust = series.copy()
+        robust.loc[mask] = median.loc[mask]
+        feature_values[f"feat_robust__{column}"] = robust
+    return counts, pd.DataFrame(feature_values, index=frame.index)
+
+
+def prepare_scoring_with_history(
+    training: PreparedForecastData,
+    scoring: PreparedForecastData,
+    preprocessing: Mapping[str, Any],
+    history_points: int = 672,
+) -> PreparedForecastData:
+    """用训练尾部提供因果上下文，并只返回评分期行。"""
+
+    training.assert_training_allowed()
+    if scoring.source != "scoring":
+        raise DataError("评分历史拼接要求 source=scoring")
+    if history_points <= 0:
+        raise DataError("评分历史上下文点数必须大于 0")
+    if training.raw_observations.index.max() >= scoring.raw_observations.index.min():
+        raise DataError("训练期与评分期时间边界重叠或顺序错误")
+
+    scoring_index = scoring.raw_observations.index
+    context = pd.concat(
+        [training.raw_observations.tail(int(history_points)), scoring.raw_observations],
+        axis=0,
+    ).sort_index()
+    if not context.index.is_unique:
+        raise DataError("训练尾部与评分期拼接后时间戳不唯一")
+    cleaned = clean_aligned_frame(context, preprocessing).loc[scoring_index]
+    missing_columns = [
+        str(column) for column in cleaned.columns if str(column).startswith("feat_missing__")
+    ]
+    anomaly_columns = [
+        str(column) for column in cleaned.columns if str(column).startswith("feat_outlier__")
+    ]
+    return PreparedForecastData(
+        model_input=cleaned.copy(deep=True),
+        raw_targets=scoring.raw_targets.copy(deep=True),
+        raw_observations=scoring.raw_observations.copy(deep=True),
+        missing_flags=cleaned[missing_columns].copy(deep=True),
+        anomaly_flags=cleaned[anomaly_columns].copy(deep=True),
+        label_valid_mask=scoring.label_valid_mask.copy(deep=True),
+        source="scoring",
+    )
 
 
 def write_time_frame(frame: pd.DataFrame, path: Path, timestamp_format: str) -> None:

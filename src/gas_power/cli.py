@@ -9,9 +9,8 @@ from pathlib import Path
 from typing import Any, Callable, Sequence
 
 from threadpoolctl import threadpool_limits
-from tqdm.auto import tqdm
 
-from gas_power.config import ProjectConfig, load_config
+from gas_power.config import ProjectConfig, load_config, validate_competition_command
 from gas_power.logging_utils import configure_logging, set_random_seed
 from gas_power.output_session import OutputSession
 from gas_power.pipeline import (
@@ -20,11 +19,13 @@ from gas_power.pipeline import (
     benchmark_pipeline,
     demo_pipeline,
     discover_relations_pipeline,
+    environment_pipeline,
     generate_synthetic_pipeline,
     optimize_pipeline,
     predict_pipeline,
     run_task_pipeline,
     train_pipeline,
+    tune_pipeline,
     validate_pipeline,
     validate_submission_pipeline,
 )
@@ -33,13 +34,96 @@ from gas_power.runtime import configure_runtime
 
 Pipeline = Callable[[ProjectConfig], dict[str, Any]]
 
+COMMAND_LABELS = {
+    "generate-synthetic": "生成合成数据",
+    "doctor": "检查高精度训练环境",
+    "train": "训练模型",
+    "tune": "高精度搜索与门控",
+    "validate": "滚动验证",
+    "audit-data": "数据审计",
+    "benchmark": "基线评测",
+    "discover-relations": "关系发现",
+    "backtest": "扩展回测",
+    "predict": "生成预测结果",
+    "optimize": "发电优化",
+    "validate-submission": "校验提交文件",
+    "run": "完整预测任务",
+    "demo": "合成数据演示",
+}
+
+MODEL_LABELS = {
+    "WeightedEnsembleModel": "加权融合模型",
+    "LastValueModel": "最后值保持模型",
+}
+
+
+def _result_section(
+    command: str,
+    result: dict[str, Any],
+    section_name: str,
+) -> dict[str, Any] | None:
+    """兼容单阶段命令和完整任务的嵌套返回结构。"""
+
+    if command == section_name:
+        return result
+    section = result.get(section_name)
+    return section if isinstance(section, dict) else None
+
+
+def _format_console_summary(command: str, result: dict[str, Any]) -> str:
+    """生成适合人工阅读的简短中文运行摘要。"""
+
+    lines = [f"运行完成：{COMMAND_LABELS.get(command, command)}"]
+    train = _result_section(command, result, "train")
+    if train is not None:
+        model_type = str(train.get("model_type", "未知模型"))
+        model_label = MODEL_LABELS.get(model_type, model_type)
+        rows = int(train.get("training_rows", 0))
+        lines.append(
+            f"训练：{model_label}，{rows:,} 行，"
+            f"{train.get('train_start', '未知')} 至 {train.get('train_end', '未知')}"
+        )
+
+    validation = _result_section(command, result, "validate")
+    if validation is not None:
+        leakage_label = {
+            "passed": "通过",
+            "failed": "未通过",
+        }.get(str(validation.get("leakage_checks", "")), "未知")
+        lines.append(
+            f"验证：{int(validation.get('folds', 0))} 折，泄漏检查{leakage_label}"
+        )
+
+    prediction = _result_section(command, result, "predict")
+    if prediction is not None:
+        runtime = prediction.get("runtime", {})
+        seconds = (
+            float(runtime.get("total_inference_seconds", 0.0))
+            if isinstance(runtime, dict)
+            else 0.0
+        )
+        lines.append(
+            f"预测：{int(prediction.get('origins', 0))} 个起点，推理耗时 {seconds:.2f} 秒"
+        )
+
+    archive_path = result.get("submission_archive")
+    if archive_path:
+        lines.append(f"提交压缩包：{archive_path}")
+    result_file = result.get("result_file")
+    if result_file:
+        lines.append(f"完整结果：{result_file}")
+    output_directory = result.get("output_directory")
+    if output_directory:
+        lines.append(f"输出目录：{output_directory}")
+    return "\n".join(lines)
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="煤气发电量预测与发电优化")
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path("config/default.yaml"),
+        default=Path("config/official_preliminary.yaml"),
         help="YAML 配置文件路径",
     )
     parser.add_argument(
@@ -54,9 +138,17 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="显示或关闭 tqdm 进度条",
     )
+    parser.add_argument(
+        "--json",
+        dest="json_output",
+        action="store_true",
+        help="在终端输出完整结果 JSON；默认仅显示中文摘要",
+    )
     subparsers = parser.add_subparsers(dest="command", required=False)
     subparsers.add_parser("generate-synthetic", help="生成仅用于流程测试的合成数据")
+    subparsers.add_parser("doctor", help="检查 LightGBM、CatBoost、Optuna 和 PyTorch CUDA")
     subparsers.add_parser("train", help="预处理、构建特征并训练模型")
+    subparsers.add_parser("tune", help="运行 Optuna 粗筛、完整时间折复核和 OOF 融合")
     subparsers.add_parser("validate", help="执行时间滚动验证和泄漏检查")
     subparsers.add_parser("audit-data", help="执行时间语义和数据泄漏审计")
     subparsers.add_parser("benchmark", help="在统一时间折上比较强基线矩阵")
@@ -74,7 +166,9 @@ def build_parser() -> argparse.ArgumentParser:
 def _pipelines() -> dict[str, Pipeline]:
     return {
         "generate-synthetic": generate_synthetic_pipeline,
+        "doctor": environment_pipeline,
         "train": train_pipeline,
+        "tune": tune_pipeline,
         "validate": validate_pipeline,
         "audit-data": audit_data_pipeline,
         "benchmark": benchmark_pipeline,
@@ -91,7 +185,8 @@ def _pipelines() -> dict[str, Pipeline]:
 def main(argv: Sequence[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
     config = load_config(args.config)
-    workers, show_progress = configure_runtime(config, args.workers, args.progress)
+    validate_competition_command(config, str(args.command))
+    workers, _ = configure_runtime(config, args.workers, args.progress)
     output_session = OutputSession.start(config)
     config.ensure_runtime_dirs()
     set_random_seed(config.seed)
@@ -102,34 +197,37 @@ def main(argv: Sequence[str] | None = None) -> None:
         filename=str(logging_config.get("filename", "pipeline.log")),
     )
     pipeline = _pipelines()[str(args.command)]
-    logger.info("开始命令: %s，工作线程: %d", args.command, workers)
+    command = str(args.command)
+    command_label = COMMAND_LABELS.get(command, command)
+    logger.info("开始：%s（%d 个工作线程）", command_label, workers)
     try:
         with threadpool_limits(limits=workers):
-            with tqdm(
-                total=1,
-                desc=f"任务 {args.command}",
-                unit="项",
-                dynamic_ncols=True,
-                disable=not show_progress,
-            ) as task_progress:
-                result = pipeline(config)
-                archive_path = output_session.create_submission_archive(
-                    required=str(args.command) in {"run", "demo", "predict"}
-                )
-                if archive_path is not None:
-                    result["submission_archive"] = str(archive_path)
-                task_progress.update(1)
+            result = pipeline(config)
+            archive_path = output_session.create_submission_archive(
+                required=command in {"run", "demo", "predict"}
+            )
+            if archive_path is not None:
+                result["submission_archive"] = str(archive_path)
     except Exception:
-        logger.exception("命令失败: %s", args.command)
+        logger.exception("失败：%s", command_label)
         final_directory, _ = output_session.finalize()
-        logger.info("未完成结果已归档: %s", final_directory)
+        logger.info("未完成结果已归档：%s", final_directory)
         raise
     final_directory, completed_at = output_session.finalize()
     result = output_session.relocate_result_paths(result, final_directory)
     result["output_directory"] = str(final_directory)
     result["completed_at"] = completed_at.isoformat()
-    logger.info("命令完成: %s", args.command)
-    print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+    result_file = final_directory / "运行结果.json"
+    result["result_file"] = str(result_file)
+    result_file.write_text(
+        json.dumps(result, ensure_ascii=False, indent=2, default=str) + "\n",
+        encoding="utf-8",
+    )
+    logger.info("完成：%s", command_label)
+    if args.json_output:
+        print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+    else:
+        print(_format_console_summary(command, result))
 
 
 if __name__ == "__main__":

@@ -155,7 +155,8 @@ preprocessing:
 features:
   lag_steps: [1, 2, 4, 8, 16, 96, 672]
   rolling_windows: [4, 8, 16, 96]
-  rolling_statistics: [mean, std, min, max, slope]
+  rolling_statistics: [mean, std, min, max, slope, quantile]
+  rolling_quantiles: true
   unit_online_threshold_mw: 1.0
   stable_delta_threshold_mw: 2.0
 
@@ -181,6 +182,25 @@ forecast:
       learning_rate: 0.05
       num_leaves: 31
       n_jobs: -1
+      objective: regression_l1
+    sample_weighting:
+      mape: true
+      floor_quantile: 0.01
+      minimum_floor: 1.0e-6
+      recency_half_life_days: 30
+    training_window_days: 90
+  deep_learning:
+    context_steps: 192
+    context_candidates: [192, 384, 672]
+    epochs: 200
+    patience: 20
+    batch_size: 128
+    learning_rate: 0.001
+    hidden_size: 64
+    patch_size: 16
+    dropout: 0.1
+    seeds: [2026, 2027, 2028]
+    device: auto
   prediction_origins:
     mode: tail
     count: 4

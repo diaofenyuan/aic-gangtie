@@ -108,6 +108,17 @@ def test_features_shift_before_rolling_and_pass_future_perturbation() -> None:
     assert "feat_state_generator_all_ramp_up" in features
 
 
+def test_feature_progress_reports_each_configured_source_group() -> None:
+    builder = _builder()
+    completed: list[str] = []
+
+    builder.transform(_frame(), progress_callback=completed.append)
+
+    assert len(completed) == builder.progress_steps()
+    assert "构建字段特征 generator_1" in completed
+    assert completed[-1] == "组装特征表"
+
+
 def test_numbered_industrial_sources_are_aggregated_by_pattern() -> None:
     frame = pd.DataFrame(
         {

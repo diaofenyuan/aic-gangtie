@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import time
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -12,20 +14,34 @@ import numpy as np
 import pandas as pd
 from tqdm.auto import tqdm
 
-from gas_power.availability import FeatureAvailabilityRegistry
 from gas_power.audit import calculate_lag_correlations, run_data_audit
+from gas_power.availability import FeatureAvailabilityRegistry
 from gas_power.benchmark import run_baseline_benchmark
 from gas_power.config import ProjectConfig, configured_value
-from gas_power.data import ConfiguredDataLoader, write_time_frame
+from gas_power.data import (
+    ConfiguredDataLoader,
+    PreparedForecastData,
+    load_original_input_frame,
+    prepare_scoring_with_history,
+    write_time_frame,
+)
 from gas_power.features import (
     CausalFeatureBuilder,
     assert_feature_causality,
     assert_shift_before_rolling,
 )
+from gas_power.environment import check_high_accuracy_environment
+from gas_power.gpu_gate import evaluate_gpu_gate, evaluate_residual_gate
 from gas_power.models import build_model
 from gas_power.models.base import prediction_column, prediction_columns
 from gas_power.models.baselines import LastValueModel
 from gas_power.models.factory import baseline_from_spec
+from gas_power.models.ensemble import HorizonWeightedEnsembleModel
+from gas_power.ensemble_selection import (
+    apply_oof_weights,
+    evaluate_candidate_gate,
+    fit_oof_weights,
+)
 from gas_power.optimization import (
     DispatchInput,
     HighsDispatchOptimizer,
@@ -36,16 +52,27 @@ from gas_power.postprocessing import (
     PhysicalForecastPostprocessor,
     compare_postprocessing_metrics,
 )
-from gas_power.gpu_gate import evaluate_gpu_gate, evaluate_residual_gate
 from gas_power.relations import discover_relations
 from gas_power.runtime import progress_enabled, track_progress
 from gas_power.scoring import ConfigurableScorer
 from gas_power.submission import validate_submission_bundle
+from gas_power.submission_freeze import freeze_submission
 from gas_power.synthetic import SYNTHETIC_WARNING, generate_synthetic_dataset
 from gas_power.validation import (
+    RecentWindowSplitter,
     run_rolling_validation,
     splitter_from_config,
     summarize_detailed_validation,
+)
+from gas_power.tuning import (
+    candidate_config_from_descriptor,
+    run_deep_search,
+    run_tree_search,
+)
+
+OFFICIAL_PRELIMINARY_DATA_NOTICE = (
+    "当前仅使用赛事方提供的初赛参赛数据；评分集不得进入训练、调参、"
+    "特征构造或模型选择，赛事数据不得传播或公开展示。"
 )
 
 
@@ -53,6 +80,19 @@ def _write_json(payload: Any, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as stream:
         json.dump(payload, stream, ensure_ascii=False, indent=2, default=str)
+
+
+def _data_notice(config: ProjectConfig) -> str:
+    """根据数据配置返回真实且可审计的数据来源说明。"""
+
+    compliance = config.raw.get("competition_compliance")
+    if (
+        isinstance(compliance, Mapping)
+        and compliance.get("stage") == "preliminary"
+        and compliance.get("official_data_only") is True
+    ):
+        return OFFICIAL_PRELIMINARY_DATA_NOTICE
+    return SYNTHETIC_WARNING
 
 
 def _feature_builder(config: ProjectConfig) -> CausalFeatureBuilder:
@@ -68,30 +108,48 @@ def _feature_builder(config: ProjectConfig) -> CausalFeatureBuilder:
 def prepare_data(
     config: ProjectConfig,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+    prepared, features, quality = prepare_prepared_data(config)
+    return prepared.model_input, features, quality
+
+
+def prepare_prepared_data(
+    config: ProjectConfig,
+) -> tuple[PreparedForecastData, pd.DataFrame, dict[str, Any]]:
     config.ensure_runtime_dirs()
+    loader = ConfiguredDataLoader(config)
+    builder = _feature_builder(config)
+    cache_steps = 3
     with tqdm(
-        total=3,
+        total=loader.progress_steps() + builder.progress_steps() + cache_steps,
         desc="数据准备",
-        unit="步",
+        unit="项",
         dynamic_ncols=True,
         leave=False,
         disable=not progress_enabled(config),
+        mininterval=0.2,
     ) as data_progress:
-        frame, quality = ConfiguredDataLoader(config).load()
-        data_progress.set_postfix_str("特征构建")
-        data_progress.update(1)
-        builder = _feature_builder(config)
-        features = builder.transform(frame)
-        data_progress.set_postfix_str("写入缓存")
-        data_progress.update(1)
+        def advance(label: str) -> None:
+            data_progress.set_postfix_str(f"完成: {label}", refresh=False)
+            data_progress.update(1)
+
+        data_progress.set_postfix_str("正在读取数据", refresh=True)
+        prepared, quality = loader.load_prepared(progress_callback=advance, source="training")
+        frame = prepared.model_input
+        data_progress.set_postfix_str("正在构建特征", refresh=True)
+        features = builder.transform(frame, progress_callback=advance)
         cache_dir = config.path("cache")
         timestamp_format = str(config.section("data")["timestamp_format"])
+        data_progress.set_postfix_str("正在写入 processed.csv", refresh=True)
         write_time_frame(frame, cache_dir / "processed.csv", timestamp_format)
+        advance("写入 processed.csv")
+        data_progress.set_postfix_str("正在写入 features.csv", refresh=True)
         write_time_frame(features, cache_dir / "features.csv", timestamp_format)
+        advance("写入 features.csv")
         quality_path = cache_dir / "data_quality.json"
+        data_progress.set_postfix_str("正在写入 data_quality.json", refresh=True)
         quality.write_json(quality_path)
-        data_progress.update(1)
-    return frame, features, quality.to_dict()
+        advance("写入 data_quality.json")
+    return prepared, features, quality.to_dict()
 
 
 def generate_synthetic_pipeline(config: ProjectConfig) -> dict[str, Any]:
@@ -99,16 +157,47 @@ def generate_synthetic_pipeline(config: ProjectConfig) -> dict[str, Any]:
     return generate_synthetic_dataset(config)
 
 
+def environment_pipeline(config: ProjectConfig) -> dict[str, Any]:
+    report = check_high_accuracy_environment()
+    _write_json(report, config.path("reports", "reports") / "environment.json")
+    return report
+
+
+def _is_preliminary(config: ProjectConfig) -> bool:
+    compliance = config.raw.get("competition_compliance")
+    return (
+        isinstance(compliance, Mapping)
+        and compliance.get("stage") == "preliminary"
+    )
+
+
+def _model_horizons(config: ProjectConfig) -> list[int]:
+    """初赛模型只训练和验证短周期，避免无关的 96 步任务稀释目标。"""
+
+    forecast = config.section("forecast")
+    steps = int(forecast["short_steps"] if _is_preliminary(config) else forecast["long_steps"])
+    return list(range(1, steps + 1))
+
+
 def train_pipeline(config: ProjectConfig) -> dict[str, Any]:
-    frame, features, quality = prepare_data(config)
+    prepared, features, quality = prepare_prepared_data(config)
+    prepared.assert_training_allowed()
+    frame = prepared.model_input
     roles = config.section("data")["roles"]
     targets = [str(value) for value in roles["targets"]]
-    long_steps = int(config.section("forecast")["long_steps"])
-    horizons = list(range(1, long_steps + 1))
+    horizons = _model_horizons(config)
     _assert_final_residual_gate(config)
     model = build_model(config)
     train_end = pd.Timestamp(frame.index.max())
-    model.fit(frame, targets, horizons, train_end=train_end)
+    model.fit(
+        frame,
+        targets,
+        horizons,
+        train_end=train_end,
+        raw_targets=prepared.raw_targets,
+        feature_matrix=features,
+        data_source=prepared.source,
+    )
     model_path = config.path("models") / "forecast_model.joblib"
     joblib.dump(model, model_path, compress=3)
     metadata = {
@@ -117,17 +206,227 @@ def train_pipeline(config: ProjectConfig) -> dict[str, Any]:
         "train_end": str(train_end),
         "training_rows": len(frame),
         "targets": targets,
-        "horizons": [1, long_steps],
+        "horizons": [horizons[0], horizons[-1]],
+        "decision_inputs": "TRAINING_VALIDATION_ONLY",
         "seed": config.seed,
-        "synthetic_data_warning": SYNTHETIC_WARNING,
+        "data_notice": _data_notice(config),
         "quality_report": quality,
         "feature_columns": list(features.columns),
+        "raw_label_columns": targets,
+        "training_data_source": prepared.source,
         "feature_source_whitelist": sorted(
             FeatureAvailabilityRegistry.from_config(config).allowed_source_columns("long")
         ),
     }
     _write_json(metadata, config.path("models") / "forecast_model_metadata.json")
     return metadata
+
+
+def tune_pipeline(config: ProjectConfig) -> dict[str, Any]:
+    """执行训练期粗筛、完整复核、OOF 融合，并冻结唯一可训练候选。"""
+
+    prepared, features, _ = prepare_prepared_data(config)
+    prepared.assert_training_allowed()
+    settings = config.raw.get("optuna", {})
+    settings = settings if isinstance(settings, Mapping) else {}
+    tree_candidates, study = run_tree_search(
+        config,
+        prepared,
+        _feature_builder(config),
+        feature_matrix=features,
+        n_trials=int(settings.get("n_trials", 30)),
+        top_k=int(settings.get("top_k", 5)),
+        show_progress=progress_enabled(config),
+    )
+    deep_settings = config.section("forecast").get("deep_learning", {})
+    deep_settings = deep_settings if isinstance(deep_settings, Mapping) else {}
+    deep_candidates = (
+        run_deep_search(
+            config,
+            prepared,
+            _feature_builder(config),
+            feature_matrix=features,
+            coarse_folds=int(deep_settings.get("coarse_folds", 4)),
+            top_k=int(deep_settings.get("search_top_k", 2)),
+            coarse_epochs=int(deep_settings.get("coarse_epochs", 60)),
+            show_progress=progress_enabled(config),
+        )
+        if bool(deep_settings.get("search_enabled", False))
+        else []
+    )
+    candidates = sorted(
+        [*tree_candidates, *deep_candidates], key=lambda item: item.selection_metric
+    )
+    reports = config.path("reports", "reports")
+    results = config.path("results")
+    targets = [str(value) for value in config.section("data")["roles"]["targets"]]
+    horizons = _model_horizons(config)
+    recent_config = config.raw.get("recent_validation", {})
+    recent_config = recent_config if isinstance(recent_config, Mapping) else {}
+    splitter = RecentWindowSplitter(
+        folds=int(recent_config.get("folds", 10)),
+        validation_points=int(recent_config.get("validation_points", 192)),
+        step_points=int(recent_config.get("step_points", 192)),
+        rolling_train_points=(
+            int(recent_config["rolling_train_points"])
+            if recent_config.get("rolling_train_points") is not None
+            else None
+        ),
+    )
+    validation = config.section("validation")
+    baseline = run_rolling_validation(
+        frame=prepared.model_input,
+        model_factory=LastValueModel,
+        splitter=splitter,
+        target_columns=targets,
+        horizons=horizons,
+        interval_minutes=15,
+        near_zero_threshold=float(validation.get("near_zero_threshold", 1.0e-6)),
+        worst_error_count=50,
+        raw_targets=prepared.raw_targets,
+        feature_matrix=features,
+        data_source=prepared.source,
+    )
+
+    passed = [candidate for candidate in candidates if candidate.gate.passed]
+    keys = ["fold", "origin", "target_datetime", "target", "horizon_steps"]
+    oof = baseline.predictions[keys + ["y_true", "y_pred"]].rename(
+        columns={"y_pred": "last_value"}
+    )
+    component_configs: dict[str, ProjectConfig] = {}
+    for candidate in passed:
+        name = f"trial_{candidate.trial_number}"
+        oof = oof.merge(
+            candidate.recent_predictions[keys + ["y_pred"]].rename(columns={"y_pred": name}),
+            on=keys,
+            how="inner",
+            validate="one_to_one",
+        )
+        component_configs[name] = candidate_config_from_descriptor(
+            config, candidate.parameters
+        )
+
+    model_names = ["last_value", *component_configs]
+    column_weights: dict[str, dict[str, float]] = {}
+    loo_parts: list[pd.DataFrame] = []
+    fused = oof[keys + ["y_true"]].copy()
+    fused["y_pred"] = np.nan
+    fused_loo = fused.copy()
+    for target in targets:
+        for horizon in horizons:
+            weights, loo = fit_oof_weights(
+                oof,
+                model_names,
+                target_column=target,
+                horizon=horizon,
+            )
+            prediction_name = prediction_column(target, horizon)
+            column_weights[prediction_name] = {
+                name: float(weight) for name, weight in zip(model_names, weights)
+            }
+            if not loo.empty:
+                loo.insert(0, "target", target)
+                loo.insert(1, "horizon_steps", horizon)
+                loo_parts.append(loo)
+            mask = (oof["target"] == target) & (oof["horizon_steps"] == horizon)
+            fused.loc[mask, "y_pred"] = apply_oof_weights(
+                {name: oof.loc[mask, name].to_numpy(dtype=float) for name in model_names},
+                weights,
+            )
+            for held_out in loo.itertuples(index=False):
+                held_mask = mask & (oof["fold"] == held_out.fold)
+                fused_loo.loc[held_mask, "y_pred"] = apply_oof_weights(
+                    {
+                        name: oof.loc[held_mask, name].to_numpy(dtype=float)
+                        for name in model_names
+                    },
+                    held_out.weights,
+                )
+
+    if fused_loo["y_pred"].isna().any():
+        raise ValueError("留一折融合预测未覆盖全部 OOF 样本")
+    fusion_gate = evaluate_candidate_gate(baseline.predictions, fused_loo)
+    components: dict[str, Any] = {"last_value": LastValueModel()}
+    if fusion_gate.passed:
+        components.update({name: build_model(item) for name, item in component_configs.items()})
+        final_model: Any = HorizonWeightedEnsembleModel(components, column_weights)
+        selected_status = "OOF_GATE_PASSED"
+    else:
+        final_model = LastValueModel()
+        selected_status = "FALLBACK_LAST_VALUE"
+        column_weights = {
+            prediction_column(target, horizon): {"last_value": 1.0}
+            for target in targets
+            for horizon in horizons
+        }
+    final_model.fit(
+        prepared.model_input,
+        targets,
+        horizons,
+        train_end=pd.Timestamp(prepared.model_input.index.max()),
+        raw_targets=prepared.raw_targets,
+        feature_matrix=features,
+        data_source=prepared.source,
+    )
+    model_path = config.path("models") / "forecast_model.joblib"
+    joblib.dump(final_model, model_path, compress=3)
+
+    candidate_rows = [
+        {
+            "trial": item.trial_number,
+            "recent_mape": item.recent_mape,
+            "recent_worst_mape": item.recent_worst_mape,
+            "cross_month_mape": item.cross_month_mape,
+            "selection_metric": item.selection_metric,
+            **{f"gate_{key}": value for key, value in item.gate.to_dict().items() if key != "reasons"},
+            "gate_reasons": " | ".join(item.gate.reasons),
+            "parameters": json.dumps(item.parameters, ensure_ascii=False, sort_keys=True),
+        }
+        for item in candidates
+    ]
+    pd.DataFrame(candidate_rows).to_csv(
+        reports / "high_accuracy_candidates.csv", index=False, encoding="utf-8"
+    )
+    oof.to_csv(reports / "high_accuracy_oof.csv", index=False, encoding="utf-8")
+    fused.to_csv(reports / "high_accuracy_fused_oof.csv", index=False, encoding="utf-8")
+    fused_loo.to_csv(
+        reports / "high_accuracy_fused_leave_one_fold.csv",
+        index=False,
+        encoding="utf-8",
+    )
+    if loo_parts:
+        pd.concat(loo_parts, ignore_index=True).to_csv(
+            reports / "high_accuracy_leave_one_fold.csv", index=False, encoding="utf-8"
+        )
+    model_hash = hashlib.sha256(model_path.read_bytes()).hexdigest()
+    metadata = {
+        "status": selected_status,
+        "model_type": type(final_model).__name__,
+        "training_data_source": prepared.source,
+        "decision_inputs": "TRAINING_VALIDATION_ONLY",
+        "scoring_used_for_training": False,
+        "raw_labels": True,
+        "seed": config.seed,
+        "targets": targets,
+        "horizons": horizons,
+        "feature_columns": list(features.columns),
+        "fusion_gate": fusion_gate.to_dict(),
+        "weights": column_weights,
+        "model_sha256": model_hash,
+        "optuna_best_value": float(study.best_value),
+        "optuna_trials": len(study.trials),
+    }
+    _write_json(metadata, config.path("models") / "forecast_model_metadata.json")
+    _write_json(metadata, reports / "high_accuracy_selection.json")
+    return {
+        "status": selected_status,
+        "passed_candidates": len(passed),
+        "fusion_gate": fusion_gate.to_dict(),
+        "model": str(model_path),
+        "model_sha256": model_hash,
+        "reports": str(reports),
+        "results": str(results),
+    }
 
 
 def _prediction_origins(config: ProjectConfig, frame: pd.DataFrame) -> pd.DatetimeIndex:
@@ -152,13 +451,18 @@ def _prediction_origins(config: ProjectConfig, frame: pd.DataFrame) -> pd.Dateti
             origins_frame["datetime"], format=timestamp_format, errors="raise"
         )
         return pd.DatetimeIndex(origins)
+    if mode == "scoring":
+        if frame.empty:
+            raise ValueError("评分期预测起点不能为空")
+        return pd.DatetimeIndex(frame.index)
     raise ValueError(f"不支持的预测起点模式: {mode}")
 
 
 def predict_pipeline(config: ProjectConfig) -> dict[str, Any]:
     inference_started = time.perf_counter()
     _assert_final_residual_gate(config)
-    frame, features, _ = prepare_data(config)
+    train_prepared, train_features, _ = prepare_prepared_data(config)
+    train_frame = train_prepared.model_input
     model_path = config.path("models") / "forecast_model.joblib"
     if not model_path.exists():
         raise FileNotFoundError(f"模型文件不存在，请先运行 train: {model_path}")
@@ -166,28 +470,88 @@ def predict_pipeline(config: ProjectConfig) -> dict[str, Any]:
     targets = [str(value) for value in config.section("data")["roles"]["targets"]]
     forecast_config = config.section("forecast")
     short_horizons = list(range(1, int(forecast_config["short_steps"]) + 1))
-    long_horizons = list(range(1, int(forecast_config["long_steps"]) + 1))
     interval_minutes = int(config.section("optimization").get("interval_minutes", 15))
     timestamp_format = str(config.section("data")["timestamp_format"])
-    origins = _prediction_origins(config, frame)
+    origin_mode = str(forecast_config.get("prediction_origins", {}).get("mode", "tail"))
 
-    raw_long_prediction = model.predict(frame, origins, targets, long_horizons)
+    if origin_mode == "scoring":
+        scoring_raw = _load_scoring_prepared(config)
+        history_points = int(
+            config.raw.get("competition_compliance", {}).get("scoring_history_points", 672)
+            if isinstance(config.raw.get("competition_compliance", {}), Mapping)
+            else 672
+        )
+        scoring_prepared = prepare_scoring_with_history(
+            train_prepared,
+            scoring_raw,
+            config.section("preprocessing"),
+            history_points=history_points,
+        )
+        scoring_start = pd.Timestamp(scoring_prepared.model_input.index.min())
+        frame = pd.concat(
+            [train_frame.loc[train_frame.index < scoring_start], scoring_prepared.model_input],
+            axis=0,
+        ).sort_index()
+        if not frame.index.is_unique:
+            raise ValueError("训练历史与评分期输入拼接后存在重复时间戳")
+        origins = _prediction_origins(config, scoring_prepared.model_input)
+        features = _feature_builder(config).transform(frame)
+        settings = config.raw.get("prediction_input", {})
+        table_paths = settings.get("table_paths", {}) if isinstance(settings, Mapping) else {}
+        if not isinstance(table_paths, Mapping) or not table_paths:
+            raise ValueError("scoring 模式必须配置 prediction_input.table_paths")
+        original_input = load_original_input_frame(
+            config,
+            config.path("scoring_data"),
+            table_paths,
+        )
+        missing_input_origins = origins.difference(original_input.index)
+        if len(missing_input_origins):
+            raise ValueError(
+                f"官方原始输入未覆盖全部预测起点: {missing_input_origins[:3].tolist()}"
+            )
+        original_columns = [
+            str(column)
+            for column in original_input.columns
+            if not str(column).startswith("feat_")
+        ]
+        # 提交原始字段保持官方输入值；模型输入的缺失填补只在内存中使用。
+        input_sources = original_input.loc[origins, original_columns].copy().fillna(0.0)
+        original_input_features = scoring_prepared.model_input.loc[
+            origins,
+            [str(column) for column in scoring_prepared.model_input.columns if str(column).startswith("feat_")],
+        ]
+    else:
+        frame = train_frame
+        features = train_features
+        origins = _prediction_origins(config, frame)
+        registry = FeatureAvailabilityRegistry.from_config(config)
+        approved_sources = sorted(
+            set(frame.columns).intersection(registry.allowed_source_columns("long"))
+        )
+        input_sources = frame.loc[origins, approved_sources]
+        original_input_features = pd.DataFrame(index=origins)
+
+    prediction_horizons = _model_horizons(config)
+    raw_prediction = model.predict(frame, origins, targets, prediction_horizons)
+
     post_config = config.raw.get("postprocessing", {})
     post_result = PhysicalForecastPostprocessor(post_config, interval_minutes).apply(
-        raw_long_prediction, frame, origins, targets, long_horizons
+        raw_prediction, frame, origins, targets, prediction_horizons
     )
-    long_prediction = (
+    prediction = (
         post_result.predictions
         if bool(post_config.get("enabled", True))
-        else raw_long_prediction
+        else raw_prediction
     )
-    short_prediction = long_prediction[prediction_columns(targets, short_horizons, interval_minutes)]
+    short_prediction = prediction[
+        prediction_columns(targets, short_horizons, interval_minutes)
+    ]
     results_dir = config.path("results")
-    raw_short = raw_long_prediction[
+    raw_short = raw_prediction[
         prediction_columns(targets, short_horizons, interval_minutes)
     ]
     write_time_frame(raw_short, results_dir / "raw_s_result.csv", timestamp_format)
-    write_time_frame(raw_long_prediction, results_dir / "raw_l_result.csv", timestamp_format)
     capacities = post_config.get("target_capacity_mw", {})
     submission_config = config.raw.get("submission", {})
     tolerance = float(submission_config.get("capacity_tolerance_mw", 1.0e-6))
@@ -203,27 +567,41 @@ def predict_pipeline(config: ProjectConfig) -> dict[str, Any]:
         enforce_target_consistency=bool(post_config.get("enforce_target_consistency", True)),
         capacity_tolerance=tolerance,
     )
-    long_output = write_forecast_csv(
-        long_prediction,
-        results_dir / "l_result.csv",
-        targets,
-        long_horizons,
-        timestamp_format,
-        interval_minutes,
-        expected_origins=origins,
-        capacity_bounds=dict(capacities) if isinstance(capacities, dict) else None,
-        enforce_target_consistency=bool(post_config.get("enforce_target_consistency", True)),
-        capacity_tolerance=tolerance,
-    )
 
-    registry = FeatureAvailabilityRegistry.from_config(config)
-    approved_sources = sorted(
-        set(frame.columns).intersection(registry.allowed_source_columns("long"))
+    long_output: pd.DataFrame | None = None
+    if not _is_preliminary(config):
+        long_horizons = list(range(1, int(forecast_config["long_steps"]) + 1))
+        write_time_frame(raw_prediction, results_dir / "raw_l_result.csv", timestamp_format)
+        long_output = write_forecast_csv(
+            prediction,
+            results_dir / "l_result.csv",
+            targets,
+            long_horizons,
+            timestamp_format,
+            interval_minutes,
+            expected_origins=origins,
+            capacity_bounds=dict(capacities) if isinstance(capacities, dict) else None,
+            enforce_target_consistency=bool(post_config.get("enforce_target_consistency", True)),
+            capacity_tolerance=tolerance,
+        )
+
+    feature_output = features.loc[origins]
+    invalid_feature_names = [
+        str(column) for column in feature_output.columns if not str(column).startswith("feat_")
+    ]
+    if invalid_feature_names:
+        raise ValueError(f"派生输入字段必须以 feat_ 开头: {invalid_feature_names[:5]}")
+    model_only_features = feature_output.drop(
+        columns=feature_output.columns.intersection(original_input_features.columns),
     )
-    input_frame = pd.concat([frame[approved_sources], features], axis=1).loc[origins]
+    input_frame = pd.concat(
+        [input_sources, original_input_features, model_only_features],
+        axis=1,
+    )
     if input_frame.columns.duplicated().any():
         raise ValueError("input.csv 构建后存在重复字段")
     write_time_frame(input_frame, results_dir / "input.csv", timestamp_format)
+    freeze_manifest = freeze_submission(results_dir)
     elapsed_seconds = float(time.perf_counter() - inference_started)
     seconds_per_sample = elapsed_seconds / max(1, len(origins))
     performance = config.raw.get("performance", {})
@@ -244,21 +622,57 @@ def predict_pipeline(config: ProjectConfig) -> dict[str, Any]:
             f"单样本 {seconds_per_sample:.3f}s/{max_per_sample:.3f}s，"
             f"总计 {elapsed_seconds:.3f}s/{max_total:.3f}s"
         )
-    return {
+    result = {
         "origins": len(origins),
         "short_shape": list(short_output.shape),
-        "long_shape": list(long_output.shape),
         "s_result": str(results_dir / "s_result.csv"),
-        "l_result": str(results_dir / "l_result.csv"),
         "input": str(results_dir / "input.csv"),
+        "input_original_columns": len(input_sources.columns),
+        "submission_freeze": str(results_dir / "submission_freeze.json"),
+        "submission_frozen": True,
+        "submission_hashes": {
+            name: details["sha256"]
+            for name, details in freeze_manifest["files"].items()
+        },
         "postprocessing_adjusted_cells": post_result.adjusted_cells,
         "postprocessing_adjustments": post_result.adjustments,
         "runtime": runtime_report,
     }
+    if long_output is not None:
+        result["long_shape"] = list(long_output.shape)
+        result["l_result"] = str(results_dir / "l_result.csv")
+    return result
+
+
+def _load_scoring_prepared(config: ProjectConfig) -> PreparedForecastData:
+    """从受限评分期目录读取预测输入，不修改训练配置或训练缓存。"""
+
+    settings = config.raw.get("prediction_input", {})
+    if not isinstance(settings, Mapping):
+        raise TypeError("prediction_input 必须是字典")
+    table_paths = settings.get("table_paths", {})
+    if not isinstance(table_paths, Mapping) or not table_paths:
+        raise ValueError("prediction_input.table_paths 必须是非空字典")
+    scoring_raw = deepcopy(config.raw)
+    scoring_raw["paths"]["data"] = str(config.path("scoring_data"))
+    scoring_tables = scoring_raw["data"]["tables"]
+    for table_name, table_path in table_paths.items():
+        if table_name not in scoring_tables:
+            raise ValueError(f"评分期输入配置包含未知数据表: {table_name}")
+        scoring_tables[table_name]["path"] = str(table_path)
+    scoring_config = ProjectConfig(
+        raw=scoring_raw,
+        source=config.source,
+        root=config.root,
+    )
+    prepared, _ = ConfiguredDataLoader(scoring_config).load_prepared(source="scoring")
+    return prepared
 
 
 def validate_pipeline(config: ProjectConfig) -> dict[str, Any]:
-    frame, _, _ = prepare_data(config)
+    prepared, features, _ = prepare_prepared_data(config)
+    prepared.assert_training_allowed()
+    frame = prepared.model_input
     builder = _feature_builder(config)
     cutoff = pd.Timestamp(frame.index[len(frame) // 2])
     assert_feature_causality(builder, frame, cutoff)
@@ -266,8 +680,7 @@ def validate_pipeline(config: ProjectConfig) -> dict[str, Any]:
     rolling_windows = [int(value) for value in config.section("features")["rolling_windows"]]
     assert_shift_before_rolling(builder, frame, targets[0], rolling_windows[0])
 
-    forecast = config.section("forecast")
-    horizons = list(range(1, int(forecast["long_steps"]) + 1))
+    horizons = _model_horizons(config)
     validation_config = config.section("validation")
     interval_minutes = int(config.section("optimization").get("interval_minutes", 15))
     artifacts = run_rolling_validation(
@@ -280,9 +693,42 @@ def validate_pipeline(config: ProjectConfig) -> dict[str, Any]:
         near_zero_threshold=float(validation_config.get("near_zero_threshold", 1.0e-6)),
         worst_error_count=int(validation_config.get("worst_error_count", 50)),
         feature_builder=builder,
+        raw_targets=prepared.raw_targets,
+        feature_matrix=features,
+        data_source=prepared.source,
         show_progress=progress_enabled(config),
         progress_description="滚动验证",
     )
+    recent_artifacts = None
+    if _is_preliminary(config):
+        recent_config = config.raw.get("recent_validation", {})
+        if not isinstance(recent_config, Mapping):
+            recent_config = {}
+        recent_artifacts = run_rolling_validation(
+            frame=frame,
+            model_factory=lambda: build_model(config),
+            splitter=RecentWindowSplitter(
+                folds=int(recent_config.get("folds", 10)),
+                validation_points=int(recent_config.get("validation_points", 192)),
+                step_points=int(recent_config.get("step_points", 192)),
+                rolling_train_points=(
+                    int(recent_config["rolling_train_points"])
+                    if recent_config.get("rolling_train_points") is not None
+                    else None
+                ),
+            ),
+            target_columns=targets,
+            horizons=horizons,
+            interval_minutes=interval_minutes,
+            near_zero_threshold=float(validation_config.get("near_zero_threshold", 1.0e-6)),
+            worst_error_count=int(validation_config.get("worst_error_count", 50)),
+            feature_builder=builder,
+            raw_targets=prepared.raw_targets,
+            feature_matrix=features,
+            data_source=prepared.source,
+            show_progress=progress_enabled(config),
+            progress_description="最近两天滚动验证",
+        )
     results_dir = config.path("results")
     artifacts.metrics.to_csv(
         results_dir / "validation_metrics.csv", index=False, encoding="utf-8"
@@ -293,6 +739,13 @@ def validate_pipeline(config: ProjectConfig) -> dict[str, Any]:
     artifacts.predictions.to_csv(
         results_dir / "validation_predictions.csv", index=False, encoding="utf-8"
     )
+    if recent_artifacts is not None:
+        recent_artifacts.metrics.to_csv(
+            results_dir / "recent_validation_metrics.csv", index=False, encoding="utf-8"
+        )
+        recent_artifacts.predictions.to_csv(
+            results_dir / "recent_validation_predictions.csv", index=False, encoding="utf-8"
+        )
     split_payload = [
         {
             "fold": split.fold,
@@ -310,8 +763,14 @@ def validate_pipeline(config: ProjectConfig) -> dict[str, Any]:
         "prediction_pairs": len(artifacts.predictions),
         "metrics_rows": len(artifacts.metrics),
         "metric_files_generated": True,
-        "warning": SYNTHETIC_WARNING,
+        "warning": _data_notice(config),
         "leakage_checks": "passed",
+        "validation_protocol": {
+            "cross_month_folds": len(artifacts.splits),
+            "recent_folds": len(recent_artifacts.splits) if recent_artifacts is not None else 0,
+            "raw_labels": True,
+            "scoring_used": False,
+        },
     }
 
 
@@ -344,7 +803,7 @@ def audit_data_pipeline(config: ProjectConfig) -> dict[str, Any]:
         "future_red_risk_count": len(future),
         "future_red_fields": sorted(future["feature"].astype(str).unique().tolist()),
         "reports": str(reports),
-        "warning": SYNTHETIC_WARNING,
+        "warning": _data_notice(config),
     }
 
 
@@ -425,7 +884,7 @@ def benchmark_pipeline(config: ProjectConfig) -> dict[str, Any]:
         "prediction_pairs": len(artifacts.predictions),
         "best_rows": len(artifacts.best),
         "reachability": artifacts.reachability,
-        "warning": SYNTHETIC_WARNING,
+        "warning": _data_notice(config),
     }
 
 
@@ -446,7 +905,7 @@ def discover_relations_pipeline(config: ProjectConfig) -> dict[str, Any]:
     )
     artifacts.setpoints.to_csv(reports / "setpoint_analysis.csv", index=False, encoding="utf-8")
     artifacts.delays.to_csv(reports / "delay_relations.csv", index=False, encoding="utf-8")
-    return {**artifacts.summary, "reports": str(reports), "warning": SYNTHETIC_WARNING}
+    return {**artifacts.summary, "reports": str(reports), "warning": _data_notice(config)}
 
 
 def _postprocess_validation_tidy(
@@ -597,7 +1056,7 @@ def backtest_pipeline(config: ProjectConfig) -> dict[str, Any]:
         "coverage": coverage,
         "residual_gate": residual_gate,
         "gpu_gate": gpu_gate.to_dict(),
-        "warning": SYNTHETIC_WARNING,
+        "warning": _data_notice(config),
     }
 
 
@@ -908,14 +1367,28 @@ def demo_pipeline(config: ProjectConfig) -> dict[str, Any]:
 
 
 def run_task_pipeline(config: ProjectConfig) -> dict[str, Any]:
-    """使用 data 中的现有数据执行训练、验证、预测和优化。"""
+    """执行当前赛段允许的训练、验证、预测及可选优化阶段。"""
 
-    stages = (
-        ("train", train_pipeline),
-        ("validate", validate_pipeline),
-        ("predict", predict_pipeline),
-        ("optimize", optimize_pipeline),
+    compliance = config.raw.get("competition_compliance", {})
+    preliminary = (
+        isinstance(compliance, Mapping)
+        and compliance.get("stage") == "preliminary"
     )
+    if preliminary:
+        # 初赛默认入口必须先完成训练期搜索和原始标签门控，不能直接提交未选择的基线。
+        stages = [
+            ("tune", tune_pipeline),
+            ("validate", validate_pipeline),
+            ("predict", predict_pipeline),
+        ]
+    else:
+        stages = [
+            ("train", train_pipeline),
+            ("validate", validate_pipeline),
+            ("predict", predict_pipeline),
+        ]
+    if not preliminary:
+        stages.append(("optimize", optimize_pipeline))
     results: dict[str, Any] = {}
     stage_iterator = track_progress(
         stages,
