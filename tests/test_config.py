@@ -70,6 +70,27 @@ def test_official_preliminary_config_uses_isolated_official_paths() -> None:
     assert "test_evaluation" not in config.raw
 
 
+def test_official_tuning_budget_is_bounded_and_keeps_full_month_validation() -> None:
+    config = load_config(PROJECT_ROOT / "config" / "official_preliminary.yaml")
+    tuning = config.section("optuna")
+
+    assert tuning["n_trials"] == 30
+    assert tuning["n_startup_trials"] == 10
+    assert tuning["top_k"] == 5
+    assert tuning["coarse_folds"] == 4
+    assert tuning["strategy"] == "global"
+    assert tuning["n_estimators_min"] == 150
+    assert tuning["n_estimators_max"] == 750
+    assert tuning["catboost_iterations_max"] == 225
+    assert config.section("recent_validation")["folds"] == 8
+    assert config.section("validation")["folds"] == 8
+
+    fast = load_config(PROJECT_ROOT / "config" / "official_preliminary_fast.yaml")
+    assert fast.section("optuna")["n_trials"] == 8
+    assert fast.section("optuna")["top_k"] == 2
+    assert fast.section("optuna")["coarse_folds"] == 2
+
+
 def test_official_input_keeps_all_raw_fields_with_original_names() -> None:
     config = load_config(PROJECT_ROOT / "config" / "official_preliminary.yaml")
     settings = config.section("prediction_input")

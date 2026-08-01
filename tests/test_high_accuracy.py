@@ -1,17 +1,27 @@
 from __future__ import annotations
 
+from pathlib import Path
+from types import SimpleNamespace
+
 import numpy as np
 import pandas as pd
 import pytest
 import joblib
 from pandas.testing import assert_frame_equal
 
+from gas_power.config import load_config
 from gas_power.data import (
+    DataError,
     DataQualityReport,
     PreparedForecastData,
     clean_aligned_frame,
+    inspect_submission_input_quality,
+    normalize_submission_input_frame,
+    prepare_submission_sources,
     prepare_scoring_with_history,
+    sanitize_submission_features,
 )
+from gas_power.ensemble_selection import evaluate_oof_column_gate
 from gas_power.ensemble_selection import (
     apply_oof_weights,
     mape_sample_weights,
@@ -21,7 +31,16 @@ from gas_power.features import CausalFeatureBuilder
 from gas_power.models.baselines import LastValueModel
 from gas_power.models.boosting import BoostingMultiHorizonModel
 from gas_power.models.deep import NeuralResidualMultiHorizonModel
-from gas_power.models.parameterization import ComponentReconstructionModel
+from gas_power.models.factory import build_model
+from gas_power.models.parameterization import (
+    ComponentReconstructionModel,
+    GasAvailabilityForecastModel,
+)
+from gas_power.pipeline import (
+    _assert_selection_fold_coverage,
+    _combine_selection_predictions,
+)
+from gas_power.tuning import candidate_config_from_settings, select_diverse_trials_for_review
 from gas_power.validation import RecentWindowSplitter, run_rolling_validation
 
 
@@ -42,6 +61,125 @@ def _prepared(
         label_valid_mask=raw_targets.notna(),
         source=source,
     )
+
+
+def test_tuned_candidate_can_use_global_multi_horizon_strategy() -> None:
+    project_root = Path(__file__).resolve().parents[1]
+    config = load_config(project_root / "config" / "official_preliminary.yaml")
+    candidate = candidate_config_from_settings(
+        config,
+        backend="lightgbm",
+        training_window_days=60,
+        half_life_days=30,
+        parameters={"n_estimators": 150},
+        parameterization="direct",
+        strategy="global",
+    )
+
+    assert candidate.section("forecast")["machine_learning"]["strategy"] == "global"
+    assert candidate.section("residual_model")["strategy"] == "global"
+    assert build_model(candidate).fit_progress_steps(
+        ["generator_1", "generator_all"], list(range(1, 9))
+    ) == 2
+
+
+def test_submission_sources_drop_training_empty_columns_and_repair_missing() -> None:
+    train_index = pd.date_range("2025-01-01", periods=120, freq="15min")
+    score_index = pd.date_range(train_index[-1] + pd.Timedelta(minutes=15), periods=8, freq="15min")
+    training = pd.DataFrame(
+        {
+            "valid": np.linspace(10.0, 20.0, len(train_index)),
+            "invalid": np.nan,
+        },
+        index=train_index,
+    )
+    scoring = pd.DataFrame(
+        {"valid": np.linspace(21.0, 28.0, len(score_index)), "invalid": np.nan},
+        index=score_index,
+    )
+    scoring.loc[score_index[0], "valid"] = np.nan
+
+    repaired, diagnostics = prepare_submission_sources(
+        training,
+        scoring,
+        {"imputation": {"method": "ffill", "limit": None}, "outliers": {"enabled": False}},
+        score_index,
+        history_points=96,
+    )
+
+    assert list(repaired.columns) == ["valid"]
+    assert repaired.at[score_index[0], "valid"] == training.iloc[-1]["valid"]
+    assert np.isfinite(repaired.to_numpy(dtype=float)).all()
+    assert diagnostics["invalid_columns"] == ["invalid"]
+
+
+def test_submission_features_use_training_only_pruning_and_finite_fallback() -> None:
+    index = pd.date_range("2025-01-01", periods=8, freq="15min")
+    training = pd.DataFrame(
+        {
+            "feat_keep": np.arange(8.0),
+            "feat_duplicate": np.arange(8.0),
+            "feat_constant": 1.0,
+            "feat_empty": np.nan,
+        },
+        index=index,
+    )
+    scoring = training.iloc[-3:].copy()
+    scoring.iloc[0, scoring.columns.get_loc("feat_keep")] = np.nan
+
+    cleaned, diagnostics = sanitize_submission_features(training, scoring)
+
+    assert list(cleaned.columns) == ["feat_keep"]
+    assert np.isfinite(cleaned.to_numpy(dtype=float)).all()
+    assert diagnostics["duplicate"] == ["feat_duplicate"]
+    assert diagnostics["constant"] == ["feat_constant"]
+    assert diagnostics["all_nonfinite"] == ["feat_empty"]
+
+
+def test_submission_matrix_normalization_passes_strict_quality_gate() -> None:
+    index = pd.date_range("2025-05-01", periods=12, freq="15min")
+    feature_keep = np.array([*range(11), 100.0], dtype=float)
+    frame = pd.DataFrame(
+        {
+            "feature_keep": feature_keep,
+            "feature_duplicate": feature_keep,
+            "feature_constant": 5.0,
+            "feature_zero_iqr": [0.0] * 11 + [1.0],
+        },
+        index=index,
+    )
+
+    cleaned, diagnostics = normalize_submission_input_frame(
+        frame,
+        {
+            "drop_constant_columns": True,
+            "drop_duplicate_columns": True,
+            "iqr_multiplier": 1.5,
+        },
+    )
+
+    assert list(cleaned.columns) == ["feature_keep"]
+    assert cleaned["feature_keep"].max() < 100.0
+    assert diagnostics["winsorized_cells"] == 2
+    assert diagnostics["dropped_constant_columns_before_winsor"] == [
+        "feature_constant"
+    ]
+    assert diagnostics["dropped_duplicate_columns_before_winsor"] == [
+        "feature_duplicate"
+    ]
+    assert diagnostics["dropped_constant_columns_after_winsor"] == [
+        "feature_zero_iqr"
+    ]
+    assert diagnostics["passed"]
+    assert diagnostics["clip_iqr_multiplier"] == 1.0
+    assert diagnostics["final_quality"]["constant_columns"] == []
+    assert diagnostics["final_quality"]["duplicate_columns"] == []
+    assert diagnostics["final_quality"]["iqr_outlier_cells"] == 0
+    assert diagnostics["final_quality"]["iqr_outlier_cells_all_methods"] == 0
+    assert diagnostics["final_quality"]["zscore_outlier_cells"] == 0
+    serialized_quality = inspect_submission_input_quality(cleaned)
+    assert serialized_quality["iqr_outlier_cells_all_methods"] == 0
+    assert serialized_quality["zscore_outlier_cells"] == 0
 
 
 def test_outlier_detection_never_replaces_finite_labels() -> None:
@@ -126,6 +264,62 @@ def test_scoring_context_fill_and_future_perturbation_are_causal() -> None:
         baseline.model_input.loc[:scoring_index[3]],
         candidate.model_input.loc[:scoring_index[3]],
     )
+
+
+def test_scoring_context_allows_shared_official_reference_timestamp() -> None:
+    train_index = pd.date_range("2025-04-30 23:15:00", periods=4, freq="15min")
+    scoring_index = pd.date_range(train_index[-1], periods=3, freq="15min")
+    training_frame = pd.DataFrame(
+        {
+            "generator_1": [10.0, 11.0, 12.0, 13.0],
+            "generator_all": [20.0, 21.0, 22.0, 23.0],
+        },
+        index=train_index,
+    )
+    scoring_frame = pd.DataFrame(
+        {
+            "generator_1": [13.0, 14.0, 15.0],
+            "generator_all": [23.0, 24.0, 25.0],
+        },
+        index=scoring_index,
+    )
+    settings = {
+        "imputation": {"method": "ffill", "limit": 8},
+        "outliers": {"enabled": False},
+    }
+
+    prepared = prepare_scoring_with_history(
+        _prepared(training_frame, source="training"),
+        _prepared(scoring_frame, source="scoring"),
+        settings,
+        history_points=3,
+    )
+
+    assert prepared.model_input.index.equals(scoring_index)
+    assert prepared.model_input.at[scoring_index[0], "generator_1"] == 13.0
+
+
+def test_scoring_context_rejects_training_data_after_scoring_start() -> None:
+    train_index = pd.date_range("2025-05-01 00:00:00", periods=3, freq="15min")
+    scoring_index = pd.date_range("2025-05-01 00:15:00", periods=3, freq="15min")
+    training_frame = pd.DataFrame(
+        {"generator_1": 10.0, "generator_all": 20.0}, index=train_index
+    )
+    scoring_frame = pd.DataFrame(
+        {"generator_1": 11.0, "generator_all": 21.0}, index=scoring_index
+    )
+    settings = {
+        "imputation": {"method": "ffill", "limit": 8},
+        "outliers": {"enabled": False},
+    }
+
+    with pytest.raises(DataError, match="训练期结束时间晚于评分期起点"):
+        prepare_scoring_with_history(
+            _prepared(training_frame, source="training"),
+            _prepared(scoring_frame, source="scoring"),
+            settings,
+            history_points=3,
+        )
 
 
 def test_scoring_source_is_rejected_by_training_interfaces() -> None:
@@ -242,6 +436,150 @@ def test_component_parameterization_reconstructs_total_target() -> None:
     )
     assert np.isfinite(prediction.to_numpy()).all()
     assert prediction.iloc[0]["generator_all_t+15_pred"] >= prediction.iloc[0]["generator_1_t+15_pred"]
+
+
+def test_gas_availability_model_predicts_resource_then_consistent_generation() -> None:
+    index = pd.date_range("2025-01-01", periods=240, freq="15min")
+    x = np.arange(len(index), dtype=float)
+    production = 120.0 + 5.0 * np.sin(x / 12.0)
+    demand = 70.0 + 2.0 * np.cos(x / 8.0)
+    holder = 50_000.0 + 20.0 * np.sin(x / 20.0)
+    available = production - demand - np.r_[np.nan, np.diff(holder)]
+    available = np.nan_to_num(available, nan=available[1])
+    one = 80.0 + 0.3 * available
+    total = one + 40.0 + 0.1 * available
+    frame = pd.DataFrame(
+        {
+            "generator_1": one,
+            "generator_all": total,
+            "blast_furnace_1": production,
+            "blast_furnace_user1": demand,
+            "blast_furnace_gas_holder_1": holder,
+        },
+        index=index,
+    )
+    builder = CausalFeatureBuilder(
+        feature_config={
+            "lag_steps": [1, 4],
+            "rolling_windows": [4],
+            "rolling_statistics": ["mean", "std"],
+        },
+        roles={
+            "targets": ["generator_1", "generator_all"],
+            "gas_production": {"blast_furnace": "blast_furnace_1"},
+            "gas_user_demand": {"blast_furnace": "blast_furnace_user1"},
+            "gas_process_demand": {},
+            "gas_holder": {"blast_furnace": "blast_furnace_gas_holder_1"},
+        },
+    )
+    stage1 = BoostingMultiHorizonModel(
+        backend="lightgbm",
+        strategy="global",
+        target_mode="residual",
+        feature_builder=builder,
+        parameters={"n_estimators": 5, "n_jobs": 1},
+        baseline_model=LastValueModel(),
+    )
+    model = GasAvailabilityForecastModel(stage1, builder)
+    model.fit(
+        frame,
+        ["generator_1", "generator_all"],
+        [1, 2],
+        raw_targets=frame[["generator_1", "generator_all"]],
+    )
+
+    origins = pd.DatetimeIndex(index[-4:])
+    prediction = model.predict(
+        frame, origins, ["generator_1", "generator_all"], [1, 2]
+    )
+
+    assert prediction.shape == (4, 4)
+    assert np.isfinite(prediction.to_numpy(dtype=float)).all()
+    for horizon in (15, 30):
+        assert (
+            prediction[f"generator_all_t+{horizon}_pred"]
+            >= prediction[f"generator_1_t+{horizon}_pred"]
+        ).all()
+
+
+def test_column_gate_accepts_stable_per_horizon_gain_without_whole_model_gate() -> None:
+    folds = np.repeat(np.arange(8), 4)
+    truth = np.full(len(folds), 100.0)
+    oof = pd.DataFrame(
+        {
+            "fold": folds,
+            "target": "generator_all",
+            "horizon_steps": 8,
+            "y_true": truth,
+            "last_value": truth + 10.0,
+            "candidate": truth + np.where(folds < 6, 6.0, 11.0),
+        }
+    )
+
+    gate = evaluate_oof_column_gate(
+        oof,
+        target_column="generator_all",
+        horizon=8,
+        candidate_column="candidate",
+        minimum_non_degraded_folds=5,
+        maximum_worst_degradation=0.02,
+    )
+
+    assert gate.passed
+    assert gate.non_degraded_folds == 6
+
+
+def test_selection_fold_combination_requires_aligned_four_plus_four_folds() -> None:
+    def predictions(folds: int) -> pd.DataFrame:
+        return pd.DataFrame(
+            {
+                "fold": np.arange(folds),
+                "origin": pd.date_range("2025-01-01", periods=folds, freq="D"),
+            }
+        )
+
+    combined = _combine_selection_predictions(
+        predictions(4),
+        predictions(4),
+        recent_folds=4,
+        cross_month_folds=4,
+    )
+    _assert_selection_fold_coverage(
+        combined,
+        recent_folds=4,
+        cross_month_folds=4,
+        context="测试候选",
+    )
+
+    with pytest.raises(ValueError, match="缺少"):
+        _assert_selection_fold_coverage(
+            combined.loc[combined["fold"] != "recent_3"],
+            recent_folds=4,
+            cross_month_folds=4,
+            context="测试候选",
+        )
+
+
+def test_review_selection_keeps_best_trial_from_each_parameterization() -> None:
+    trials = [
+        SimpleNamespace(
+            number=number,
+            value=value,
+            user_attrs={"candidate_config": {"parameterization": family}},
+        )
+        for number, value, family in (
+            (0, 0.050, "component"),
+            (1, 0.051, "component"),
+            (2, 0.052, "direct"),
+            (3, 0.053, "direct"),
+            (4, 0.060, "gas_availability"),
+            (5, 0.054, "component"),
+        )
+    ]
+
+    selected = select_diverse_trials_for_review(trials, top_k=5)
+
+    assert [trial.number for trial in selected] == [0, 1, 2, 3, 4]
 
 
 @pytest.mark.parametrize("architecture", ["tcn", "patchtst"])

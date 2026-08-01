@@ -6,7 +6,7 @@ import json
 import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
@@ -81,6 +81,7 @@ class DataQualityReport:
     outlier_counts: dict[str, int] = field(default_factory=dict)
     missing_before_imputation: dict[str, int] = field(default_factory=dict)
     missing_after_imputation: dict[str, int] = field(default_factory=dict)
+    invalid_columns: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -417,17 +418,38 @@ def clean_aligned_frame(
     else:
         raise ConfigError(f"仅支持因果填补方法 ffill/none，收到: {method}")
 
-    # 整列缺失没有可用历史，保留缺失标记并填零，避免模型矩阵出现空列。
+    # 整列缺失没有任何可学习信息。保留在模型矩阵里并填零会把无效字段
+    # 伪装成合法常数列，也会降低官方数据清洗评分，因此连同派生标志一并剔除。
     entirely_missing = [column for column in numeric_columns if cleaned[column].isna().all()]
     if entirely_missing:
-        cleaned.loc[:, entirely_missing] = 0.0
+        invalid_features = [
+            name
+            for column in entirely_missing
+            for name in (
+                column,
+                f"feat_missing__{column}",
+                f"feat_missing_run__{column}",
+                f"feat_outlier__{column}",
+                f"feat_robust__{column}",
+            )
+        ]
+        cleaned = cleaned.drop(columns=invalid_features, errors="ignore")
+
+    # 稳健值参与模型与提交特征时必须和已填补的原字段保持相同的有限值口径。
+    for column in numeric_columns:
+        robust_column = f"feat_robust__{column}"
+        if column in cleaned and robust_column in cleaned:
+            cleaned[robust_column] = pd.to_numeric(
+                cleaned[robust_column], errors="coerce"
+            ).fillna(cleaned[column])
 
     if report is not None:
         report.outlier_counts = outlier_counts
         report.missing_before_imputation = missing_before
         report.missing_after_imputation = (
-            cleaned[numeric_columns].isna().sum().astype(int).to_dict()
+            cleaned.reindex(columns=numeric_columns).isna().sum().astype(int).to_dict()
         )
+        report.invalid_columns = entirely_missing
     return cleaned
 
 
@@ -450,7 +472,10 @@ def apply_causal_outlier_filter(
         return counts, pd.DataFrame(feature_values, index=frame.index)
     window = int(config.get("window", 96))
     min_periods = int(config.get("min_periods", max(4, window // 4)))
-    multiplier = float(config.get("iqr_multiplier", 4.0))
+    multiplier = float(config.get("iqr_multiplier", config.get("mad_multiplier", 4.0)))
+    method = str(config.get("method", "iqr")).lower()
+    if method not in {"iqr", "hampel"}:
+        raise ConfigError("异常检测方法仅支持 iqr/hampel")
     robust_with = str(config.get("robust_with", config.get("replace_with", "median")))
     if robust_with != "median":
         raise ConfigError("当前稳健特征仅支持使用历史窗口 median")
@@ -459,13 +484,22 @@ def apply_causal_outlier_filter(
         series = pd.to_numeric(frame[column], errors="coerce")
         history = series.shift(1)
         rolling = history.rolling(window=window, min_periods=min_periods)
-        q1 = rolling.quantile(0.25)
         median = rolling.median()
-        q3 = rolling.quantile(0.75)
-        iqr = q3 - q1
-        lower = q1 - multiplier * iqr
-        upper = q3 + multiplier * iqr
-        valid_threshold = iqr.notna() & (iqr > 0)
+        if method == "hampel":
+            mad = (history - median).abs().rolling(
+                window=window, min_periods=min_periods
+            ).median()
+            scale = 1.4826 * mad
+            lower = median - multiplier * scale
+            upper = median + multiplier * scale
+            valid_threshold = scale.notna() & (scale > 0)
+        else:
+            q1 = rolling.quantile(0.25)
+            q3 = rolling.quantile(0.75)
+            iqr = q3 - q1
+            lower = q1 - multiplier * iqr
+            upper = q3 + multiplier * iqr
+            valid_threshold = iqr.notna() & (iqr > 0)
         mask = valid_threshold & ((series < lower) | (series > upper))
         counts[str(column)] = int(mask.sum())
         feature_values[f"feat_outlier__{column}"] = mask.astype(np.int8)
@@ -473,6 +507,430 @@ def apply_causal_outlier_filter(
         robust.loc[mask] = median.loc[mask]
         feature_values[f"feat_robust__{column}"] = robust
     return counts, pd.DataFrame(feature_values, index=frame.index)
+
+
+def prepare_submission_sources(
+    training: pd.DataFrame,
+    scoring: pd.DataFrame,
+    preprocessing: Mapping[str, Any],
+    origins: pd.DatetimeIndex,
+    *,
+    history_points: int = 672,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """用训练历史因果修复评分期原始字段，并剔除训练期全缺失列。"""
+
+    if not isinstance(training.index, pd.DatetimeIndex) or not isinstance(
+        scoring.index, pd.DatetimeIndex
+    ):
+        raise DataError("提交输入清洗要求 DatetimeIndex")
+    if not training.index.is_unique or not scoring.index.is_unique:
+        raise DataError("提交输入清洗前时间戳必须唯一")
+    if history_points <= 0:
+        raise DataError("提交输入历史长度必须大于 0")
+    missing_origins = origins.difference(scoring.index)
+    if len(missing_origins):
+        raise DataError(f"评分原始输入未覆盖预测起点: {missing_origins[:3].tolist()}")
+
+    scoring_columns = [str(column) for column in scoring.columns]
+    numeric_training = training.reindex(columns=scoring_columns).apply(
+        pd.to_numeric, errors="coerce"
+    )
+    numeric_scoring = scoring.reindex(columns=scoring_columns).apply(
+        pd.to_numeric, errors="coerce"
+    )
+    invalid_columns = [
+        column for column in scoring_columns if numeric_training[column].notna().sum() == 0
+    ]
+    valid_columns = [column for column in scoring_columns if column not in invalid_columns]
+    if not valid_columns:
+        raise DataError("训练期没有可用于提交的有效原始字段")
+
+    scoring_start = pd.Timestamp(scoring.index.min())
+    history = numeric_training.loc[numeric_training.index < scoring_start, valid_columns].tail(
+        int(history_points)
+    )
+    context = pd.concat([history, numeric_scoring[valid_columns]], axis=0).sort_index()
+    if not context.index.is_unique:
+        raise DataError("提交输入训练历史与评分期存在重复时间戳")
+    cleaned = clean_aligned_frame(context, preprocessing)
+
+    repaired = pd.DataFrame(index=origins)
+    repairs: dict[str, int] = {}
+    outliers: dict[str, int] = {}
+    training_medians = numeric_training[valid_columns].median(axis=0, skipna=True)
+    for column in valid_columns:
+        robust_column = f"feat_robust__{column}"
+        source = (
+            pd.to_numeric(cleaned[robust_column], errors="coerce")
+            if robust_column in cleaned
+            else pd.to_numeric(cleaned[column], errors="coerce")
+        )
+        source = source.ffill().fillna(float(training_medians[column]))
+        selected = source.loc[origins]
+        if not np.isfinite(selected.to_numpy(dtype=float)).all():
+            raise DataError(f"原始提交字段 {column} 因果修复后仍包含非有限值")
+        repaired[column] = selected
+        raw_selected = numeric_scoring.loc[origins, column]
+        repairs[column] = int(raw_selected.isna().sum())
+        flag = f"feat_outlier__{column}"
+        outliers[column] = int(cleaned.loc[origins, flag].sum()) if flag in cleaned else 0
+
+    repaired.index.name = "datetime"
+    return repaired, {
+        "invalid_columns": invalid_columns,
+        "missing_repairs": repairs,
+        "outlier_repairs": outliers,
+    }
+
+
+def sanitize_submission_features(
+    training_features: pd.DataFrame,
+    scoring_features: pd.DataFrame,
+) -> tuple[pd.DataFrame, dict[str, list[str]]]:
+    """按训练期统计裁剪无效工程特征，并用训练统计填补评分特征。"""
+
+    common = [str(column) for column in scoring_features.columns if column in training_features]
+    invalid_nonfinite: list[str] = []
+    constant: list[str] = []
+    retained: list[str] = []
+    numeric_training: dict[str, pd.Series] = {}
+    for column in common:
+        series = pd.to_numeric(training_features[column], errors="coerce").replace(
+            [np.inf, -np.inf], np.nan
+        )
+        numeric_training[column] = series
+        finite = series.dropna()
+        if finite.empty:
+            invalid_nonfinite.append(column)
+        elif int(finite.nunique(dropna=True)) <= 1:
+            constant.append(column)
+        else:
+            retained.append(column)
+
+    # 完全相同的训练特征只保留最先出现的一列，保证规则确定且不读取评分标签。
+    duplicate: list[str] = []
+    if retained:
+        normalized = pd.DataFrame({column: numeric_training[column] for column in retained})
+        duplicate_mask = normalized.T.duplicated(keep="first")
+        duplicate = [str(column) for column in duplicate_mask.index[duplicate_mask]]
+        retained = [column for column in retained if column not in duplicate]
+
+    output = scoring_features.reindex(columns=retained).copy()
+    for column in retained:
+        series = pd.to_numeric(output[column], errors="coerce").replace(
+            [np.inf, -np.inf], np.nan
+        )
+        fallback = float(numeric_training[column].median(skipna=True))
+        output[column] = series.ffill().fillna(fallback)
+    if output.empty:
+        raise DataError("清理后没有可提交的工程特征")
+    if not np.isfinite(output.to_numpy(dtype=float)).all():
+        raise DataError("清理后的提交工程特征仍包含 NaN/Inf")
+    return output, {
+        "all_nonfinite": invalid_nonfinite,
+        "constant": constant,
+        "duplicate": duplicate,
+    }
+
+
+def inspect_submission_input_quality(
+    frame: pd.DataFrame,
+    *,
+    iqr_multiplier: float = 1.5,
+    iqr_interpolations: Sequence[str] = (
+        "linear",
+        "lower",
+        "higher",
+        "midpoint",
+        "nearest",
+    ),
+    zscore_threshold: float | None = 3.0,
+) -> dict[str, Any]:
+    """按多种常见评分口径统计非有限值、无效列、重复列和异常值。"""
+
+    if iqr_multiplier <= 0:
+        raise DataError("提交矩阵 IQR 倍数必须大于 0")
+    supported_interpolations = {"linear", "lower", "higher", "midpoint", "nearest"}
+    interpolations = tuple(dict.fromkeys(str(value) for value in iqr_interpolations))
+    if not interpolations or not set(interpolations).issubset(supported_interpolations):
+        raise DataError("提交矩阵包含不支持的分位数插值方法")
+    if zscore_threshold is not None and zscore_threshold <= 0:
+        raise DataError("提交矩阵 Z-score 阈值必须大于 0")
+    if frame.columns.duplicated().any():
+        duplicated_names = frame.columns[frame.columns.duplicated()].astype(str).tolist()
+        raise DataError(f"input.csv 存在重复字段名: {duplicated_names[:5]}")
+
+    numeric = frame.apply(pd.to_numeric, errors="coerce").replace(
+        [np.inf, -np.inf], np.nan
+    )
+    nonfinite_by_column = {
+        str(column): int(count)
+        for column, count in numeric.isna().sum().items()
+        if int(count) > 0
+    }
+    constant_columns = [
+        str(column)
+        for column in numeric.columns
+        if int(numeric[column].nunique(dropna=True)) <= 1
+    ]
+    duplicate_mask = numeric.T.duplicated(keep="first")
+    duplicate_columns = [
+        str(column) for column in duplicate_mask.index[duplicate_mask]
+    ]
+
+    outlier_masks = {
+        str(column): pd.Series(False, index=numeric.index) for column in numeric.columns
+    }
+    outliers_by_method: dict[str, dict[str, int]] = {}
+    for interpolation in interpolations:
+        method_counts: dict[str, int] = {}
+        for column in numeric.columns:
+            series = numeric[column].dropna()
+            if series.empty:
+                continue
+            q1 = float(series.quantile(0.25, interpolation=interpolation))
+            q3 = float(series.quantile(0.75, interpolation=interpolation))
+            iqr = q3 - q1
+            lower = q1 - iqr_multiplier * iqr
+            upper = q3 + iqr_multiplier * iqr
+            mask = (series < lower) | (series > upper)
+            count = int(mask.sum())
+            if count > 0:
+                name = str(column)
+                method_counts[name] = count
+                outlier_masks[name].loc[series.index] |= mask
+        outliers_by_method[interpolation] = method_counts
+
+    linear_outliers = outliers_by_method.get("linear", {})
+    all_iqr_outliers = {
+        column: int(mask.sum())
+        for column, mask in outlier_masks.items()
+        if int(mask.sum()) > 0
+    }
+    zscore_outliers: dict[str, int] = {}
+    if zscore_threshold is not None:
+        for column in numeric.columns:
+            series = numeric[column].dropna()
+            standard_deviation = float(series.std(ddof=0))
+            if series.empty or standard_deviation <= 0:
+                continue
+            count = int(
+                (
+                    (series - float(series.mean())).abs()
+                    > float(zscore_threshold) * standard_deviation
+                ).sum()
+            )
+            if count > 0:
+                zscore_outliers[str(column)] = count
+
+    return {
+        "rows": int(len(frame)),
+        "columns": int(len(frame.columns)),
+        "nonfinite_cells": int(sum(nonfinite_by_column.values())),
+        "nonfinite_by_column": nonfinite_by_column,
+        "constant_columns": constant_columns,
+        "duplicate_columns": duplicate_columns,
+        "iqr_multiplier": float(iqr_multiplier),
+        "iqr_interpolations": list(interpolations),
+        "iqr_outlier_cells": int(sum(linear_outliers.values())),
+        "iqr_outliers_by_column": linear_outliers,
+        "iqr_outlier_cells_all_methods": int(sum(all_iqr_outliers.values())),
+        "iqr_outliers_by_column_all_methods": all_iqr_outliers,
+        "iqr_method_summary": {
+            method: {
+                "cells": int(sum(counts.values())),
+                "columns": int(len(counts)),
+            }
+            for method, counts in outliers_by_method.items()
+        },
+        "zscore_threshold": zscore_threshold,
+        "zscore_outlier_cells": int(sum(zscore_outliers.values())),
+        "zscore_outliers_by_column": zscore_outliers,
+    }
+
+
+def normalize_submission_input_frame(
+    frame: pd.DataFrame,
+    settings: Mapping[str, Any],
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """只在提交副本上消除无效列、重复列和全局 IQR 异常值。"""
+
+    iqr_multiplier = float(settings.get("iqr_multiplier", 1.5))
+    clip_iqr_multiplier = float(settings.get("clip_iqr_multiplier", 1.0))
+    interpolation_values = settings.get(
+        "iqr_interpolations",
+        ["linear", "lower", "higher", "midpoint", "nearest"],
+    )
+    if not isinstance(interpolation_values, list):
+        raise DataError("submission.quality_normalization.iqr_interpolations 必须是列表")
+    iqr_interpolations = [str(value) for value in interpolation_values]
+    zscore_threshold = float(settings.get("zscore_threshold", 3.0))
+    max_iqr_passes = int(settings.get("max_iqr_passes", 10))
+    drop_constants = bool(settings.get("drop_constant_columns", True))
+    drop_duplicates = bool(settings.get("drop_duplicate_columns", True))
+    if max_iqr_passes <= 0:
+        raise DataError("提交矩阵 IQR 截尾轮数必须大于 0")
+    if clip_iqr_multiplier <= 0 or clip_iqr_multiplier >= iqr_multiplier:
+        raise DataError("提交矩阵截尾落点必须大于 0 且小于 IQR 验收倍数")
+    initial_quality = inspect_submission_input_quality(
+        frame,
+        iqr_multiplier=iqr_multiplier,
+        iqr_interpolations=iqr_interpolations,
+        zscore_threshold=zscore_threshold,
+    )
+    if initial_quality["nonfinite_cells"]:
+        raise DataError(
+            "提交矩阵归一化前仍包含 NaN/Inf 或非数值单元格: "
+            f"{initial_quality['nonfinite_by_column']}"
+        )
+
+    output = frame.apply(pd.to_numeric, errors="raise").astype(float)
+    output.index = frame.index
+    output.index.name = frame.index.name
+
+    constant_before = initial_quality["constant_columns"] if drop_constants else []
+    output = output.drop(columns=constant_before, errors="ignore")
+
+    duplicate_before: list[str] = []
+    if drop_duplicates and not output.empty:
+        duplicate_mask = output.T.duplicated(keep="first")
+        duplicate_before = [
+            str(column) for column in duplicate_mask.index[duplicate_mask]
+        ]
+        output = output.drop(columns=duplicate_before, errors="ignore")
+
+    winsorized_by_column: dict[str, int] = {}
+    winsorization_passes: list[dict[str, Any]] = []
+    constant_after: list[str] = []
+    for pass_number in range(1, max_iqr_passes + 1):
+        pass_counts: dict[str, int] = {}
+        for column in output.columns:
+            series = output[column]
+            q1 = float(series.quantile(0.25))
+            q3 = float(series.quantile(0.75))
+            iqr = q3 - q1
+            gate_lower = q1 - iqr_multiplier * iqr
+            gate_upper = q3 + iqr_multiplier * iqr
+            clip_lower = q1 - clip_iqr_multiplier * iqr
+            clip_upper = q3 + clip_iqr_multiplier * iqr
+            mask = (series < gate_lower) | (series > gate_upper)
+            count = int(mask.sum())
+            if count > 0:
+                # 截在验收边界内侧，为 CSV 浮点往返和分位数重算保留余量。
+                output[column] = series.clip(lower=clip_lower, upper=clip_upper)
+                name = str(column)
+                pass_counts[name] = count
+                winsorized_by_column[name] = winsorized_by_column.get(name, 0) + count
+
+        new_constants = [
+            str(column)
+            for column in output.columns
+            if int(output[column].nunique(dropna=True)) <= 1
+        ]
+        if drop_constants and new_constants:
+            output = output.drop(columns=new_constants, errors="ignore")
+            constant_after.extend(
+                column for column in new_constants if column not in constant_after
+            )
+        winsorization_passes.append(
+            {
+                "pass": pass_number,
+                "winsorized_cells": int(sum(pass_counts.values())),
+                "columns": pass_counts,
+                "dropped_constant_columns": new_constants,
+            }
+        )
+        pass_quality = inspect_submission_input_quality(
+            output,
+            iqr_multiplier=iqr_multiplier,
+            iqr_interpolations=("linear",),
+            zscore_threshold=None,
+        )
+        if pass_quality["iqr_outlier_cells"] == 0:
+            break
+
+    duplicate_after: list[str] = []
+    if drop_duplicates and not output.empty:
+        duplicate_mask = output.T.duplicated(keep="first")
+        duplicate_after = [
+            str(column) for column in duplicate_mask.index[duplicate_mask]
+        ]
+        output = output.drop(columns=duplicate_after, errors="ignore")
+
+    residual_quality = inspect_submission_input_quality(
+        output,
+        iqr_multiplier=iqr_multiplier,
+        iqr_interpolations=iqr_interpolations,
+        zscore_threshold=zscore_threshold,
+    )
+    residual_outlier_columns = sorted(
+        set(residual_quality["iqr_outliers_by_column_all_methods"])
+        | set(residual_quality["zscore_outliers_by_column"])
+    )
+    if residual_outlier_columns:
+        # 离散状态列在分位点插值下可能无限逼近边界而无法有限次收敛。
+        # 这类列不再是稳定的提交输入，直接从提交副本剔除并保留审计记录。
+        output = output.drop(columns=residual_outlier_columns, errors="ignore")
+
+    if output.empty:
+        raise DataError("提交矩阵质量归一化后没有可用特征")
+    final_quality = inspect_submission_input_quality(
+        output,
+        iqr_multiplier=iqr_multiplier,
+        iqr_interpolations=iqr_interpolations,
+        zscore_threshold=zscore_threshold,
+    )
+    gate_passed = (
+        final_quality["nonfinite_cells"] == 0
+        and not final_quality["constant_columns"]
+        and not final_quality["duplicate_columns"]
+        and final_quality["iqr_outlier_cells_all_methods"] == 0
+        and final_quality["zscore_outlier_cells"] == 0
+    )
+    if not gate_passed:
+        raise DataError(f"提交矩阵质量门禁失败: {final_quality}")
+
+    return output, {
+        "enabled": True,
+        "clip_iqr_multiplier": clip_iqr_multiplier,
+        "iqr_interpolations": iqr_interpolations,
+        "zscore_threshold": zscore_threshold,
+        "initial_quality": initial_quality,
+        "dropped_constant_columns_before_winsor": constant_before,
+        "dropped_duplicate_columns_before_winsor": duplicate_before,
+        "winsorized_cells": int(sum(winsorized_by_column.values())),
+        "winsorized_by_column": winsorized_by_column,
+        "winsorization_passes": winsorization_passes,
+        "dropped_constant_columns_after_winsor": constant_after,
+        "dropped_duplicate_columns_after_winsor": duplicate_after,
+        "dropped_residual_outlier_columns": residual_outlier_columns,
+        "final_quality": final_quality,
+        "passed": True,
+    }
+
+
+def validate_preliminary_input_frame(
+    frame: pd.DataFrame,
+    expected_origins: pd.DatetimeIndex,
+    *,
+    interval_minutes: int = 15,
+) -> None:
+    """在写盘和冻结前执行初赛 input.csv 的强约束校验。"""
+
+    if len(frame) != len(expected_origins):
+        raise DataError(f"input.csv 行数错误: {len(frame)} != {len(expected_origins)}")
+    if not frame.index.equals(expected_origins):
+        raise DataError("input.csv 时间索引与预测起点不一致")
+    if frame.index.has_duplicates or frame.columns.duplicated().any():
+        raise DataError("input.csv 存在重复时间戳或重复字段")
+    if len(frame.index) > 1:
+        expected_delta = pd.Timedelta(minutes=int(interval_minutes))
+        if not (frame.index.to_series().diff().dropna() == expected_delta).all():
+            raise DataError("input.csv 时间间隔不是连续 15 分钟")
+    numeric = frame.apply(pd.to_numeric, errors="coerce")
+    if numeric.isna().any().any() or not np.isfinite(numeric.to_numpy(dtype=float)).all():
+        bad = numeric.columns[numeric.isna().any()].tolist()
+        raise DataError(f"input.csv 包含 NaN/Inf 或非数值字段: {bad[:5]}")
 
 
 def prepare_scoring_with_history(
@@ -488,12 +946,22 @@ def prepare_scoring_with_history(
         raise DataError("评分历史拼接要求 source=scoring")
     if history_points <= 0:
         raise DataError("评分历史上下文点数必须大于 0")
-    if training.raw_observations.index.max() >= scoring.raw_observations.index.min():
-        raise DataError("训练期与评分期时间边界重叠或顺序错误")
+    scoring_start = scoring.raw_observations.index.min()
+    training_end = training.raw_observations.index.max()
+    if training_end > scoring_start:
+        raise DataError(
+            "训练期结束时间晚于评分期起点: "
+            f"training_end={training_end}, scoring_start={scoring_start}"
+        )
 
     scoring_index = scoring.raw_observations.index
+    # 官方数据会同时在训练集末尾和评分集开头提供预测参考时刻。
+    # 拼接时排除训练侧的同一时刻，由评分输入保留唯一且权威的当前观测。
+    training_history = training.raw_observations.loc[
+        training.raw_observations.index < scoring_start
+    ].tail(int(history_points))
     context = pd.concat(
-        [training.raw_observations.tail(int(history_points)), scoring.raw_observations],
+        [training_history, scoring.raw_observations],
         axis=0,
     ).sort_index()
     if not context.index.is_unique:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import os
 import time
 from copy import deepcopy
 from pathlib import Path
@@ -21,8 +22,13 @@ from gas_power.config import ProjectConfig, configured_value
 from gas_power.data import (
     ConfiguredDataLoader,
     PreparedForecastData,
+    inspect_submission_input_quality,
+    normalize_submission_input_frame,
     load_original_input_frame,
+    prepare_submission_sources,
     prepare_scoring_with_history,
+    sanitize_submission_features,
+    validate_preliminary_input_frame,
     write_time_frame,
 )
 from gas_power.features import (
@@ -34,12 +40,12 @@ from gas_power.environment import check_high_accuracy_environment
 from gas_power.gpu_gate import evaluate_gpu_gate, evaluate_residual_gate
 from gas_power.models import build_model
 from gas_power.models.base import prediction_column, prediction_columns
-from gas_power.models.baselines import LastValueModel
+from gas_power.models.baselines import DampedTrendModel, LastValueModel
 from gas_power.models.factory import baseline_from_spec
 from gas_power.models.ensemble import HorizonWeightedEnsembleModel
 from gas_power.ensemble_selection import (
     apply_oof_weights,
-    evaluate_candidate_gate,
+    evaluate_oof_column_gate,
     fit_oof_weights,
 )
 from gas_power.optimization import (
@@ -80,6 +86,129 @@ def _write_json(payload: Any, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as stream:
         json.dump(payload, stream, ensure_ascii=False, indent=2, default=str)
+
+
+def _selection_fold_subset(
+    predictions: pd.DataFrame,
+    *,
+    validation_type: str,
+    fold_count: int,
+) -> pd.DataFrame:
+    """均匀抽取指定数量时间折，并为近期/跨月折建立唯一标识。"""
+
+    folds = sorted(predictions["fold"].dropna().unique().tolist())
+    if not folds:
+        raise ValueError(f"{validation_type} 验证没有可用时间折")
+    count = min(int(fold_count), len(folds))
+    positions = np.linspace(0, len(folds) - 1, num=count, dtype=int)
+    selected = [folds[int(position)] for position in positions]
+    output = predictions.loc[predictions["fold"].isin(selected)].copy()
+    output["validation_type"] = str(validation_type)
+    output["fold"] = output["fold"].map(lambda value: f"{validation_type}_{value}")
+    return output
+
+
+def _combine_selection_predictions(
+    recent: pd.DataFrame,
+    cross_month: pd.DataFrame,
+    *,
+    recent_folds: int,
+    cross_month_folds: int,
+) -> pd.DataFrame:
+    return pd.concat(
+        [
+            _selection_fold_subset(
+                recent,
+                validation_type="recent",
+                fold_count=recent_folds,
+            ),
+            _selection_fold_subset(
+                cross_month,
+                validation_type="cross_month",
+                fold_count=cross_month_folds,
+            ),
+        ],
+        ignore_index=True,
+    )
+
+
+def _assert_selection_fold_coverage(
+    predictions: pd.DataFrame,
+    *,
+    recent_folds: int,
+    cross_month_folds: int,
+    context: str,
+) -> None:
+    """确保逐列门控使用完整且对齐的近期折和跨月折。"""
+
+    actual = set(predictions["fold"].dropna().astype(str).unique())
+    expected = {
+        *(f"recent_{fold}" for fold in range(int(recent_folds))),
+        *(f"cross_month_{fold}" for fold in range(int(cross_month_folds))),
+    }
+    if actual != expected:
+        missing = sorted(expected.difference(actual))
+        unexpected = sorted(actual.difference(expected))
+        raise ValueError(
+            f"{context} 的模型选择折未完整对齐："
+            f"缺少 {missing}，多出 {unexpected}"
+        )
+
+
+def _large_error_reports(
+    predictions: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """输出前 5% 大误差样本及按工况聚合的诊断表。"""
+
+    values = predictions.copy()
+    denominator = np.maximum(np.abs(values["y_true"].to_numpy(dtype=float)), 1.0e-6)
+    values["ape"] = np.abs(values["y_pred"] - values["y_true"]) / denominator
+    values["origin_hour"] = pd.to_datetime(values["origin"]).dt.hour
+    values["regime"] = "stable"
+    for target in values["target"].astype(str).unique():
+        target_mask = values["target"].astype(str) == target
+        for suffix in ("ramp_up", "ramp_down", "startup", "shutdown"):
+            column = f"feat_state_{target}_{suffix}"
+            if column in values:
+                mask = target_mask & (values[column].fillna(0.0) > 0.5)
+                values.loc[mask, "regime"] = suffix
+    missing_columns = [
+        column for column in values if str(column).startswith("feat_missing__")
+    ]
+    outlier_columns = [
+        column for column in values if str(column).startswith("feat_outlier__")
+    ]
+    values["has_missing"] = (
+        values[missing_columns].fillna(0.0).sum(axis=1) > 0 if missing_columns else False
+    )
+    values["has_outlier"] = (
+        values[outlier_columns].fillna(0.0).sum(axis=1) > 0 if outlier_columns else False
+    )
+    values["has_gas_gap"] = (
+        values["feat_gas_total_supply_gap"].fillna(0.0) > 0.0
+        if "feat_gas_total_supply_gap" in values
+        else False
+    )
+    thresholds = values.groupby(["target", "horizon_steps"])["ape"].transform(
+        lambda series: series.quantile(0.95)
+    )
+    largest = values.loc[values["ape"] >= thresholds].sort_values("ape", ascending=False)
+    group_columns = [
+        "target",
+        "horizon_steps",
+        "origin_hour",
+        "regime",
+        "has_missing",
+        "has_outlier",
+        "has_gas_gap",
+    ]
+    groups = values.groupby(group_columns, dropna=False).agg(
+        samples=("ape", "size"),
+        mean_mape=("ape", "mean"),
+        p95_mape=("ape", lambda series: series.quantile(0.95)),
+    ).reset_index()
+    groups = groups.sort_values(["mean_mape", "samples"], ascending=[False, False])
+    return largest, groups
 
 
 def _data_notice(config: ProjectConfig) -> str:
@@ -234,8 +363,9 @@ def tune_pipeline(config: ProjectConfig) -> dict[str, Any]:
         prepared,
         _feature_builder(config),
         feature_matrix=features,
-        n_trials=int(settings.get("n_trials", 30)),
-        top_k=int(settings.get("top_k", 5)),
+        n_trials=int(os.environ.get("GAS_POWER_TUNE_TRIALS", settings.get("n_trials", 30))),
+        top_k=int(os.environ.get("GAS_POWER_TUNE_TOP_K", settings.get("top_k", 5))),
+        coarse_folds=int(settings.get("coarse_folds", 4)),
         show_progress=progress_enabled(config),
     )
     deep_settings = config.section("forecast").get("deep_learning", {})
@@ -261,10 +391,16 @@ def tune_pipeline(config: ProjectConfig) -> dict[str, Any]:
     results = config.path("results")
     targets = [str(value) for value in config.section("data")["roles"]["targets"]]
     horizons = _model_horizons(config)
+    selection = config.raw.get("model_selection", {})
+    selection = selection if isinstance(selection, Mapping) else {}
+    recent_selection_folds = int(selection.get("recent_folds", 4))
+    cross_selection_folds = int(selection.get("cross_month_folds", 4))
+    minimum_non_degraded = int(selection.get("minimum_non_degraded_folds", 5))
+    maximum_worst_degradation = float(selection.get("maximum_worst_degradation", 0.01))
     recent_config = config.raw.get("recent_validation", {})
     recent_config = recent_config if isinstance(recent_config, Mapping) else {}
     splitter = RecentWindowSplitter(
-        folds=int(recent_config.get("folds", 10)),
+        folds=recent_selection_folds,
         validation_points=int(recent_config.get("validation_points", 192)),
         step_points=int(recent_config.get("step_points", 192)),
         rolling_train_points=(
@@ -274,6 +410,8 @@ def tune_pipeline(config: ProjectConfig) -> dict[str, Any]:
         ),
     )
     validation = config.section("validation")
+    cross_validation = dict(validation)
+    cross_validation["folds"] = cross_selection_folds
     baseline = run_rolling_validation(
         frame=prepared.model_input,
         model_factory=LastValueModel,
@@ -287,50 +425,156 @@ def tune_pipeline(config: ProjectConfig) -> dict[str, Any]:
         feature_matrix=features,
         data_source=prepared.source,
     )
+    baseline_cross = run_rolling_validation(
+        frame=prepared.model_input,
+        model_factory=LastValueModel,
+        splitter=splitter_from_config(cross_validation),
+        target_columns=targets,
+        horizons=horizons,
+        interval_minutes=15,
+        near_zero_threshold=float(validation.get("near_zero_threshold", 1.0e-6)),
+        worst_error_count=50,
+        raw_targets=prepared.raw_targets,
+        feature_matrix=features,
+        data_source=prepared.source,
+    )
+    def trend_factory() -> DampedTrendModel:
+        return DampedTrendModel(
+            window=5,
+            damping=0.85,
+            interval_minutes=15,
+        )
+    trend = run_rolling_validation(
+        frame=prepared.model_input,
+        model_factory=trend_factory,
+        splitter=splitter,
+        target_columns=targets,
+        horizons=horizons,
+        interval_minutes=15,
+        near_zero_threshold=float(validation.get("near_zero_threshold", 1.0e-6)),
+        worst_error_count=50,
+        raw_targets=prepared.raw_targets,
+        feature_matrix=features,
+        data_source=prepared.source,
+    )
+    trend_cross = run_rolling_validation(
+        frame=prepared.model_input,
+        model_factory=trend_factory,
+        splitter=splitter_from_config(cross_validation),
+        target_columns=targets,
+        horizons=horizons,
+        interval_minutes=15,
+        near_zero_threshold=float(validation.get("near_zero_threshold", 1.0e-6)),
+        worst_error_count=50,
+        raw_targets=prepared.raw_targets,
+        feature_matrix=features,
+        data_source=prepared.source,
+    )
 
-    passed = [candidate for candidate in candidates if candidate.gate.passed]
+    baseline_selection = _combine_selection_predictions(
+        baseline.predictions,
+        baseline_cross.predictions,
+        recent_folds=recent_selection_folds,
+        cross_month_folds=cross_selection_folds,
+    )
     keys = ["fold", "origin", "target_datetime", "target", "horizon_steps"]
-    oof = baseline.predictions[keys + ["y_true", "y_pred"]].rename(
+    condition_columns = [
+        str(column)
+        for column in baseline_selection.columns
+        if str(column).startswith(
+            ("feat_state_", "feat_missing__", "feat_outlier__", "feat_holder_", "feat_gas_")
+        )
+    ]
+    oof = baseline_selection[keys + ["y_true", "y_pred", *condition_columns]].rename(
         columns={"y_pred": "last_value"}
     )
+    trend_selection = _combine_selection_predictions(
+        trend.predictions,
+        trend_cross.predictions,
+        recent_folds=recent_selection_folds,
+        cross_month_folds=cross_selection_folds,
+    )
+    oof = oof.merge(
+        trend_selection[keys + ["y_pred"]].rename(columns={"y_pred": "damped_trend"}),
+        on=keys,
+        how="inner",
+        validate="one_to_one",
+    )
+    _assert_selection_fold_coverage(
+        oof,
+        recent_folds=recent_selection_folds,
+        cross_month_folds=cross_selection_folds,
+        context="基线与趋势模型",
+    )
+    component_builders: dict[str, Any] = {"damped_trend": trend_factory}
     component_configs: dict[str, ProjectConfig] = {}
-    for candidate in passed:
-        name = f"trial_{candidate.trial_number}"
+    for candidate_index, candidate in enumerate(candidates, start=1):
+        name = f"candidate_{candidate_index}_trial_{candidate.trial_number}"
+        candidate_selection = _combine_selection_predictions(
+            candidate.recent_predictions,
+            candidate.cross_month_predictions,
+            recent_folds=recent_selection_folds,
+            cross_month_folds=cross_selection_folds,
+        )
         oof = oof.merge(
-            candidate.recent_predictions[keys + ["y_pred"]].rename(columns={"y_pred": name}),
+            candidate_selection[keys + ["y_pred"]].rename(columns={"y_pred": name}),
             on=keys,
             how="inner",
             validate="one_to_one",
         )
+        _assert_selection_fold_coverage(
+            oof,
+            recent_folds=recent_selection_folds,
+            cross_month_folds=cross_selection_folds,
+            context=name,
+        )
         component_configs[name] = candidate_config_from_descriptor(
             config, candidate.parameters
         )
+        component_builders[name] = lambda item=component_configs[name]: build_model(item)
 
-    model_names = ["last_value", *component_configs]
     column_weights: dict[str, dict[str, float]] = {}
     loo_parts: list[pd.DataFrame] = []
+    column_gate_rows: list[dict[str, Any]] = []
     fused = oof[keys + ["y_true"]].copy()
     fused["y_pred"] = np.nan
     fused_loo = fused.copy()
     for target in targets:
         for horizon in horizons:
+            eligible = ["last_value"]
+            for name in component_builders:
+                candidate_gate = evaluate_oof_column_gate(
+                    oof,
+                    target_column=target,
+                    horizon=horizon,
+                    candidate_column=name,
+                    minimum_non_degraded_folds=minimum_non_degraded,
+                    maximum_worst_degradation=maximum_worst_degradation,
+                )
+                column_gate_rows.append(
+                    {
+                        "target": target,
+                        "horizon_steps": horizon,
+                        "candidate": name,
+                        "gate_type": "candidate",
+                        **candidate_gate.to_dict(),
+                    }
+                )
+                if candidate_gate.passed:
+                    eligible.append(name)
             weights, loo = fit_oof_weights(
                 oof,
-                model_names,
+                eligible,
                 target_column=target,
                 horizon=horizon,
             )
-            prediction_name = prediction_column(target, horizon)
-            column_weights[prediction_name] = {
-                name: float(weight) for name, weight in zip(model_names, weights)
-            }
             if not loo.empty:
                 loo.insert(0, "target", target)
                 loo.insert(1, "horizon_steps", horizon)
                 loo_parts.append(loo)
             mask = (oof["target"] == target) & (oof["horizon_steps"] == horizon)
             fused.loc[mask, "y_pred"] = apply_oof_weights(
-                {name: oof.loc[mask, name].to_numpy(dtype=float) for name in model_names},
+                {name: oof.loc[mask, name].to_numpy(dtype=float) for name in eligible},
                 weights,
             )
             for held_out in loo.itertuples(index=False):
@@ -338,27 +582,66 @@ def tune_pipeline(config: ProjectConfig) -> dict[str, Any]:
                 fused_loo.loc[held_mask, "y_pred"] = apply_oof_weights(
                     {
                         name: oof.loc[held_mask, name].to_numpy(dtype=float)
-                        for name in model_names
+                        for name in eligible
                     },
                     held_out.weights,
                 )
 
+            fusion_frame = oof.assign(fused_prediction=fused_loo["y_pred"])
+            fusion_gate = evaluate_oof_column_gate(
+                fusion_frame,
+                target_column=target,
+                horizon=horizon,
+                candidate_column="fused_prediction",
+                minimum_non_degraded_folds=minimum_non_degraded,
+                maximum_worst_degradation=maximum_worst_degradation,
+            )
+            column_gate_rows.append(
+                {
+                    "target": target,
+                    "horizon_steps": horizon,
+                    "candidate": "fused",
+                    "gate_type": "fusion",
+                    **fusion_gate.to_dict(),
+                }
+            )
+            prediction_name = prediction_column(target, horizon)
+            if fusion_gate.passed and len(eligible) > 1:
+                column_weights[prediction_name] = {
+                    name: float(weight)
+                    for name, weight in zip(eligible, weights)
+                    if float(weight) > 1.0e-10
+                }
+            else:
+                column_weights[prediction_name] = {"last_value": 1.0}
+                fused.loc[mask, "y_pred"] = oof.loc[mask, "last_value"]
+                fused_loo.loc[mask, "y_pred"] = oof.loc[mask, "last_value"]
+
     if fused_loo["y_pred"].isna().any():
         raise ValueError("留一折融合预测未覆盖全部 OOF 样本")
-    fusion_gate = evaluate_candidate_gate(baseline.predictions, fused_loo)
+    accepted_columns = sum(
+        any(name != "last_value" and weight > 0.0 for name, weight in weights.items())
+        for weights in column_weights.values()
+    )
+    used_model_names = {
+        name
+        for weights in column_weights.values()
+        for name, weight in weights.items()
+        if name != "last_value" and weight > 0.0
+    }
     components: dict[str, Any] = {"last_value": LastValueModel()}
-    if fusion_gate.passed:
-        components.update({name: build_model(item) for name, item in component_configs.items()})
+    if accepted_columns:
+        components.update(
+            {
+                name: component_builders[name]()
+                for name in sorted(used_model_names)
+            }
+        )
         final_model: Any = HorizonWeightedEnsembleModel(components, column_weights)
-        selected_status = "OOF_GATE_PASSED"
+        selected_status = "COLUMN_OOF_GATE_PASSED"
     else:
         final_model = LastValueModel()
         selected_status = "FALLBACK_LAST_VALUE"
-        column_weights = {
-            prediction_column(target, horizon): {"last_value": 1.0}
-            for target in targets
-            for horizon in horizons
-        }
     final_model.fit(
         prepared.model_input,
         targets,
@@ -398,6 +681,29 @@ def tune_pipeline(config: ProjectConfig) -> dict[str, Any]:
         pd.concat(loo_parts, ignore_index=True).to_csv(
             reports / "high_accuracy_leave_one_fold.csv", index=False, encoding="utf-8"
         )
+    column_gate_frame = pd.DataFrame(column_gate_rows)
+    column_gate_frame.to_csv(
+        reports / "high_accuracy_column_gates.csv", index=False, encoding="utf-8"
+    )
+    diagnostic_predictions = oof[keys + ["y_true", *condition_columns]].copy()
+    diagnostic_predictions["y_pred"] = fused_loo["y_pred"].to_numpy(dtype=float)
+    largest_errors, error_groups = _large_error_reports(diagnostic_predictions)
+    largest_errors.to_csv(
+        reports / "high_accuracy_large_errors.csv", index=False, encoding="utf-8"
+    )
+    error_groups.to_csv(
+        reports / "high_accuracy_error_groups.csv", index=False, encoding="utf-8"
+    )
+    fusion_summary = {
+        "passed": accepted_columns > 0,
+        "accepted_columns": accepted_columns,
+        "total_columns": len(targets) * len(horizons),
+        "used_models": sorted(used_model_names),
+        "recent_folds": recent_selection_folds,
+        "cross_month_folds": cross_selection_folds,
+        "minimum_non_degraded_folds": minimum_non_degraded,
+        "maximum_worst_degradation": maximum_worst_degradation,
+    }
     model_hash = hashlib.sha256(model_path.read_bytes()).hexdigest()
     metadata = {
         "status": selected_status,
@@ -410,7 +716,8 @@ def tune_pipeline(config: ProjectConfig) -> dict[str, Any]:
         "targets": targets,
         "horizons": horizons,
         "feature_columns": list(features.columns),
-        "fusion_gate": fusion_gate.to_dict(),
+        "fusion_gate": fusion_summary,
+        "column_gates": column_gate_rows,
         "weights": column_weights,
         "model_sha256": model_hash,
         "optuna_best_value": float(study.best_value),
@@ -420,8 +727,8 @@ def tune_pipeline(config: ProjectConfig) -> dict[str, Any]:
     _write_json(metadata, reports / "high_accuracy_selection.json")
     return {
         "status": selected_status,
-        "passed_candidates": len(passed),
-        "fusion_gate": fusion_gate.to_dict(),
+        "passed_candidates": len(used_model_names),
+        "fusion_gate": fusion_summary,
         "model": str(model_path),
         "model_sha256": model_hash,
         "reports": str(reports),
@@ -510,17 +817,24 @@ def predict_pipeline(config: ProjectConfig) -> dict[str, Any]:
             raise ValueError(
                 f"官方原始输入未覆盖全部预测起点: {missing_input_origins[:3].tolist()}"
             )
-        original_columns = [
-            str(column)
-            for column in original_input.columns
-            if not str(column).startswith("feat_")
-        ]
-        # 提交原始字段保持官方输入值；模型输入的缺失填补只在内存中使用。
-        input_sources = original_input.loc[origins, original_columns].copy().fillna(0.0)
-        original_input_features = scoring_prepared.model_input.loc[
+        training_tables = config.section("data")["tables"]
+        training_paths = {
+            str(table_name): str(training_tables[table_name]["path"])
+            for table_name in table_paths
+            if table_name in training_tables
+        }
+        training_original = load_original_input_frame(
+            config,
+            config.path("data"),
+            training_paths,
+        )
+        input_sources, input_quality = prepare_submission_sources(
+            training_original,
+            original_input,
+            config.section("preprocessing"),
             origins,
-            [str(column) for column in scoring_prepared.model_input.columns if str(column).startswith("feat_")],
-        ]
+            history_points=history_points,
+        )
     else:
         frame = train_frame
         features = train_features
@@ -530,7 +844,11 @@ def predict_pipeline(config: ProjectConfig) -> dict[str, Any]:
             set(frame.columns).intersection(registry.allowed_source_columns("long"))
         )
         input_sources = frame.loc[origins, approved_sources]
-        original_input_features = pd.DataFrame(index=origins)
+        input_quality = {
+            "invalid_columns": [],
+            "missing_repairs": {},
+            "outlier_repairs": {},
+        }
 
     prediction_horizons = _model_horizons(config)
     raw_prediction = model.predict(frame, origins, targets, prediction_horizons)
@@ -585,22 +903,89 @@ def predict_pipeline(config: ProjectConfig) -> dict[str, Any]:
             capacity_tolerance=tolerance,
         )
 
-    feature_output = features.loc[origins]
+    feature_output, feature_quality = sanitize_submission_features(
+        train_features,
+        features.loc[origins],
+    )
     invalid_feature_names = [
         str(column) for column in feature_output.columns if not str(column).startswith("feat_")
     ]
     if invalid_feature_names:
         raise ValueError(f"派生输入字段必须以 feat_ 开头: {invalid_feature_names[:5]}")
-    model_only_features = feature_output.drop(
-        columns=feature_output.columns.intersection(original_input_features.columns),
-    )
-    input_frame = pd.concat(
-        [input_sources, original_input_features, model_only_features],
-        axis=1,
-    )
+    input_frame = pd.concat([input_sources, feature_output], axis=1)
     if input_frame.columns.duplicated().any():
         raise ValueError("input.csv 构建后存在重复字段")
-    write_time_frame(input_frame, results_dir / "input.csv", timestamp_format)
+    quality_settings = submission_config.get("quality_normalization", {})
+    if isinstance(quality_settings, Mapping) and bool(quality_settings.get("enabled", False)):
+        input_frame, matrix_quality = normalize_submission_input_frame(
+            input_frame,
+            quality_settings,
+        )
+    else:
+        matrix_quality = {"enabled": False}
+    if _is_preliminary(config) and len(origins) != 192:
+        raise ValueError(f"初赛评分输入必须为 192 行，实际为 {len(origins)} 行")
+    validate_preliminary_input_frame(
+        input_frame,
+        origins,
+        interval_minutes=interval_minutes,
+    )
+    input_path = results_dir / "input.csv"
+    write_time_frame(input_frame, input_path, timestamp_format)
+
+    # 平台读取的是 CSV 而不是内存 DataFrame，必须按真实落盘值重新验收。
+    persisted_input = pd.read_csv(input_path, encoding="utf-8")
+    if "datetime" not in persisted_input:
+        raise ValueError("落盘后的 input.csv 缺少 datetime 字段")
+    persisted_input["datetime"] = pd.to_datetime(
+        persisted_input["datetime"],
+        format=timestamp_format,
+        errors="raise",
+    )
+    persisted_input = persisted_input.set_index("datetime")
+    persisted_input.index = pd.DatetimeIndex(persisted_input.index, name="datetime")
+    validate_preliminary_input_frame(
+        persisted_input,
+        origins,
+        interval_minutes=interval_minutes,
+    )
+    serialized_quality = inspect_submission_input_quality(
+        persisted_input,
+        iqr_multiplier=float(quality_settings.get("iqr_multiplier", 1.5))
+        if isinstance(quality_settings, Mapping)
+        else 1.5,
+        iqr_interpolations=quality_settings.get(
+            "iqr_interpolations",
+            ["linear", "lower", "higher", "midpoint", "nearest"],
+        )
+        if isinstance(quality_settings, Mapping)
+        else ["linear", "lower", "higher", "midpoint", "nearest"],
+        zscore_threshold=float(quality_settings.get("zscore_threshold", 3.0))
+        if isinstance(quality_settings, Mapping)
+        else 3.0,
+    )
+    serialized_quality_passed = (
+        serialized_quality["nonfinite_cells"] == 0
+        and not serialized_quality["constant_columns"]
+        and not serialized_quality["duplicate_columns"]
+        and serialized_quality["iqr_outlier_cells_all_methods"] == 0
+        and serialized_quality["zscore_outlier_cells"] == 0
+    )
+    if bool(matrix_quality.get("enabled", False)) and not serialized_quality_passed:
+        raise ValueError(f"落盘后的 input.csv 质量门禁失败: {serialized_quality}")
+    matrix_quality["serialized_quality"] = serialized_quality
+    matrix_quality["serialization_passed"] = serialized_quality_passed
+    _write_json(
+        {
+            "source_cleaning": input_quality,
+            "feature_pruning": feature_quality,
+            "matrix_normalization": matrix_quality,
+            "rows": len(persisted_input),
+            "columns": len(persisted_input.columns),
+            "finite": True,
+        },
+        results_dir / "reports" / "submission_input_quality.json",
+    )
     freeze_manifest = freeze_submission(results_dir)
     elapsed_seconds = float(time.perf_counter() - inference_started)
     seconds_per_sample = elapsed_seconds / max(1, len(origins))

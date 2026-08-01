@@ -6,6 +6,7 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
+from sklearn.dummy import DummyRegressor
 
 from gas_power.features import CausalFeatureBuilder
 from gas_power.models.base import (
@@ -124,6 +125,21 @@ class BoostingMultiHorizonModel(ForecastModel):
             parameters["thread_count"] = current_worker_count()
         return CatBoostRegressor(**parameters)
 
+    def _fit_estimator(
+        self,
+        x: pd.DataFrame,
+        y: pd.Series,
+        sample_weight: pd.Series,
+    ) -> tuple[Any, bool]:
+        constant_response = int(y.nunique(dropna=False)) == 1
+        estimator = (
+            DummyRegressor(strategy="constant", constant=float(y.iloc[0]))
+            if constant_response
+            else self._new_estimator()
+        )
+        estimator.fit(x, y, sample_weight=sample_weight)
+        return estimator, constant_response
+
     def fit(
         self,
         frame: pd.DataFrame,
@@ -167,6 +183,7 @@ class BoostingMultiHorizonModel(ForecastModel):
             "train_end": str(end),
             "raw_labels": True,
             "sample_weighting": dict(self.sample_weighting),
+            "constant_response_models": [],
         }
         if self.target_mode == "residual" and self.baseline_model is not None:
             self.baseline_model.fit(
@@ -185,8 +202,11 @@ class BoostingMultiHorizonModel(ForecastModel):
                     x, y, weight = self._training_slice(
                         frame, labels, features, str(target), horizon, end
                     )
-                    estimator = self._new_estimator()
-                    estimator.fit(x, y, sample_weight=weight)
+                    estimator, constant_response = self._fit_estimator(x, y, weight)
+                    if constant_response:
+                        self.training_metadata_["constant_response_models"].append(
+                            prediction_column(str(target), horizon, self.interval_minutes)
+                        )
                     self.models_[(str(target), horizon)] = estimator
                     if self._fit_progress_callback is not None:
                         self._fit_progress_callback(
@@ -207,12 +227,13 @@ class BoostingMultiHorizonModel(ForecastModel):
                     x_parts.append(x)
                     y_parts.append(y)
                     weight_parts.append(weight)
-                estimator = self._new_estimator()
-                estimator.fit(
+                estimator, constant_response = self._fit_estimator(
                     pd.concat(x_parts, axis=0),
                     pd.concat(y_parts, axis=0),
-                    sample_weight=pd.concat(weight_parts, axis=0),
+                    pd.concat(weight_parts, axis=0),
                 )
+                if constant_response:
+                    self.training_metadata_["constant_response_models"].append(str(target))
                 self.models_[str(target)] = estimator
                 if self._fit_progress_callback is not None:
                     self._fit_progress_callback(f"{target}，全局多步模型")

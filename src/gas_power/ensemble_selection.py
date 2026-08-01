@@ -31,6 +31,28 @@ class CandidateGate:
         }
 
 
+@dataclass(frozen=True)
+class ColumnGate:
+    """单个目标×步长候选相对最后值基线的稳定性门槛。"""
+
+    passed: bool
+    mean_gain: float
+    worst_gain: float
+    non_degraded_folds: int
+    total_folds: int
+    reasons: tuple[str, ...]
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "passed": self.passed,
+            "mean_gain": self.mean_gain,
+            "worst_gain": self.worst_gain,
+            "non_degraded_folds": self.non_degraded_folds,
+            "total_folds": self.total_folds,
+            "reasons": list(self.reasons),
+        }
+
+
 def mape_sample_weights(
     y_true: Sequence[float],
     *,
@@ -133,6 +155,73 @@ def apply_oof_weights(
     if not np.isfinite(output).all():
         raise ValueError("融合预测包含缺失值或无穷值")
     return output
+
+
+def evaluate_oof_column_gate(
+    oof: pd.DataFrame,
+    *,
+    target_column: str,
+    horizon: int,
+    candidate_column: str,
+    baseline_column: str = "last_value",
+    fold_column: str = "fold",
+    minimum_mean_gain: float = 0.0,
+    maximum_worst_degradation: float = 0.01,
+    minimum_non_degraded_folds: int = 5,
+) -> ColumnGate:
+    """按单列和时间折判断候选是否有资格进入 OOF 融合。"""
+
+    required = {
+        fold_column,
+        "target",
+        "horizon_steps",
+        "y_true",
+        baseline_column,
+        candidate_column,
+    }
+    missing = required.difference(oof.columns)
+    if missing:
+        raise ValueError(f"逐列门控数据缺少字段: {sorted(missing)}")
+    subset = oof.loc[
+        (oof["target"].astype(str) == str(target_column))
+        & (oof["horizon_steps"].astype(int) == int(horizon)),
+        [fold_column, "y_true", baseline_column, candidate_column],
+    ].copy()
+    values = subset[["y_true", baseline_column, candidate_column]].to_numpy(dtype=float)
+    subset = subset.loc[np.isfinite(values).all(axis=1)]
+    if subset.empty:
+        return ColumnGate(False, float("-inf"), float("-inf"), 0, 0, ("没有有限 OOF 样本",))
+    denominator = np.maximum(np.abs(subset["y_true"].to_numpy(dtype=float)), 1.0e-6)
+    subset["baseline_ape"] = (
+        np.abs(subset[baseline_column] - subset["y_true"]) / denominator
+    )
+    subset["candidate_ape"] = (
+        np.abs(subset[candidate_column] - subset["y_true"]) / denominator
+    )
+    folds = subset.groupby(fold_column, sort=True).agg(
+        baseline_mape=("baseline_ape", "mean"),
+        candidate_mape=("candidate_ape", "mean"),
+    )
+    folds["gain"] = folds["baseline_mape"] - folds["candidate_mape"]
+    mean_gain = float(folds["gain"].mean())
+    worst_gain = float(folds["gain"].min())
+    non_degraded = int((folds["gain"] >= 0.0).sum())
+    required_folds = min(int(minimum_non_degraded_folds), len(folds))
+    reasons: list[str] = []
+    if mean_gain <= float(minimum_mean_gain):
+        reasons.append("平均 MAPE 未改善")
+    if non_degraded < required_folds:
+        reasons.append(f"不退化折数不足 {required_folds}")
+    if worst_gain < -float(maximum_worst_degradation):
+        reasons.append(f"最差折退化超过 {maximum_worst_degradation:.4f}")
+    return ColumnGate(
+        passed=not reasons,
+        mean_gain=mean_gain,
+        worst_gain=worst_gain,
+        non_degraded_folds=non_degraded,
+        total_folds=len(folds),
+        reasons=tuple(reasons),
+    )
 
 
 def evaluate_candidate_gate(

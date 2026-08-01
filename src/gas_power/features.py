@@ -225,15 +225,24 @@ class CausalFeatureBuilder:
         demand = self.roles.get("gas_user_demand", {})
         process_demand = self.roles.get("gas_process_demand", {})
         holders = self.roles.get("gas_holder", {})
+        gas_balances: dict[str, pd.Series] = {}
+        gas_availability: dict[str, pd.Series] = {}
+        generator_use = self.roles.get("generator_gas_use", {})
         if isinstance(production, Mapping) and isinstance(demand, Mapping):
             for gas_type in sorted(set(production).intersection(demand)):
                 production_series, production_columns = _sum_role_series(
                     frame, production[gas_type]
                 )
-                demand_sources: list[Any] = [demand[gas_type]]
+                user_series, user_columns = _sum_role_series(frame, demand[gas_type])
+                process_series = None
+                process_columns: list[str] = []
                 if isinstance(process_demand, Mapping) and gas_type in process_demand:
-                    demand_sources.append(process_demand[gas_type])
-                demand_series, demand_columns = _sum_role_series(frame, demand_sources)
+                    process_series, process_columns = _sum_role_series(
+                        frame, process_demand[gas_type]
+                    )
+                demand_parts = [series for series in (user_series, process_series) if series is not None]
+                demand_series = sum(demand_parts[1:], demand_parts[0].copy()) if demand_parts else None
+                demand_columns = [*user_columns, *process_columns]
                 feature_name = f"feat_gas_balance_{gas_type}"
                 if (
                     production_series is not None
@@ -243,8 +252,31 @@ class CausalFeatureBuilder:
                         for column in [*production_columns, *demand_columns]
                     )
                 ):
-                    # 资源平衡同样只使用 t-1 及更早观测，避免结算延迟造成穿越。
-                    result[feature_name] = (production_series - demand_series).shift(1)
+                    raw_balance = production_series - demand_series
+                    shifted_balance = raw_balance.shift(1)
+                    gas_balances[str(gas_type)] = raw_balance
+                    result[feature_name] = shifted_balance
+                    result[f"feat_gas_production_{gas_type}"] = production_series.shift(1)
+                    result[f"feat_gas_priority_demand_{gas_type}"] = demand_series.shift(1)
+                    result[f"feat_gas_supply_gap_{gas_type}"] = (-shifted_balance).clip(lower=0.0)
+                    result[f"feat_gas_production_demand_ratio_{gas_type}"] = (
+                        production_series / demand_series.replace(0.0, np.nan)
+                    ).shift(1)
+                    for window in (4, 8, 16, 32):
+                        rolling = shifted_balance.rolling(
+                            window=window, min_periods=max(2, window // 2)
+                        )
+                        prefix = f"feat_gas_balance_{gas_type}_{window}"
+                        result[f"{prefix}_mean"] = rolling.mean()
+                        result[f"{prefix}_std"] = rolling.std(ddof=0)
+                        result[f"{prefix}_slope"] = rolling.apply(_rolling_slope, raw=True)
+
+                    if isinstance(generator_use, Mapping) and gas_type in generator_use:
+                        use_series, _ = _sum_role_series(frame, generator_use[gas_type])
+                        if use_series is not None:
+                            result[f"feat_generator_use_ratio_{gas_type}"] = (
+                                use_series / production_series.replace(0.0, np.nan)
+                            ).shift(1)
         if isinstance(holders, Mapping):
             for gas_type, holder_column_value in holders.items():
                 holder_column = str(holder_column_value)
@@ -254,14 +286,26 @@ class CausalFeatureBuilder:
                     and self._source_allowed(holder_column, 1, feature_name)
                     and self._source_allowed(holder_column, 2, feature_name)
                 ):
-                    result[feature_name] = (
-                        frame[holder_column].shift(1).diff() / float(self.interval_minutes)
-                    )
+                    holder = pd.to_numeric(frame[holder_column], errors="coerce")
+                    holder_change = holder.diff()
+                    shifted_change = holder_change.shift(1)
+                    result[feature_name] = shifted_change / float(self.interval_minutes)
+                    result[f"feat_holder_level_{gas_type}"] = holder.shift(1)
+                    result[f"feat_holder_fill_{gas_type}"] = shifted_change.clip(lower=0.0)
+                    result[f"feat_holder_release_{gas_type}"] = (-shifted_change).clip(lower=0.0)
+                    if str(gas_type) in gas_balances:
+                        available = gas_balances[str(gas_type)] - holder_change
+                        gas_availability[str(gas_type)] = available
+                        result[f"feat_gas_available_{gas_type}"] = available.shift(1)
+
+        for gas_type, balance in gas_balances.items():
+            if gas_type not in gas_availability:
+                gas_availability[gas_type] = balance
+                result[f"feat_gas_available_{gas_type}"] = balance.shift(1)
 
         production_series, _ = _sum_role_series(frame, production)
         demand_series, _ = _sum_role_series(frame, demand)
         process_series, _ = _sum_role_series(frame, process_demand)
-        generator_use = self.roles.get("generator_gas_use", {})
         use_series, _ = _sum_role_series(frame, generator_use)
         for name, series in (
             ("feat_gas_total_production", production_series),
@@ -280,6 +324,23 @@ class CausalFeatureBuilder:
             result["feat_gas_use_to_production_ratio"] = (
                 use_series / production_series.replace(0.0, np.nan)
             ).shift(1)
+        if gas_availability:
+            available_total = sum(
+                list(gas_availability.values())[1:],
+                list(gas_availability.values())[0].copy(),
+            )
+            shifted_available = available_total.shift(1)
+            result["feat_gas_total_available"] = shifted_available
+            result["feat_gas_total_supply_gap"] = (-shifted_available).clip(lower=0.0)
+            for window in (4, 8, 16, 32):
+                rolling = shifted_available.rolling(
+                    window=window, min_periods=max(2, window // 2)
+                )
+                result[f"feat_gas_total_available_{window}_mean"] = rolling.mean()
+                result[f"feat_gas_total_available_{window}_std"] = rolling.std(ddof=0)
+                result[f"feat_gas_total_available_{window}_slope"] = rolling.apply(
+                    _rolling_slope, raw=True
+                )
 
     def _add_operating_features(
         self, frame: pd.DataFrame, result: MutableMapping[str, Any]
@@ -293,6 +354,7 @@ class CausalFeatureBuilder:
             if not self._source_allowed(target_name, 0, f"feat_state_{target_name}"):
                 continue
             load = pd.to_numeric(frame[target_name], errors="coerce")
+            # 工况标签描述参考时刻之前刚刚发生的变化，不读取未来负荷。
             delta = load.diff()
             online = load > online_threshold
             result[f"feat_state_{target_name}_online"] = online.astype(np.int8)
@@ -304,6 +366,14 @@ class CausalFeatureBuilder:
             result[f"feat_state_{target_name}_ramp_up"] = (delta > stable_threshold).astype(np.int8)
             result[f"feat_state_{target_name}_ramp_down"] = (delta < -stable_threshold).astype(np.int8)
             result[f"feat_state_{target_name}_ramp_rate"] = delta / float(self.interval_minutes)
+            for window in (4, 8, 16, 32):
+                history = load.shift(1).rolling(
+                    window=window, min_periods=max(2, window // 2)
+                )
+                result[f"feat_state_{target_name}_{window}_slope"] = history.apply(
+                    _rolling_slope, raw=True
+                )
+                result[f"feat_state_{target_name}_{window}_volatility"] = history.std(ddof=0)
 
         if {"generator_1", "generator_all"}.issubset(frame.columns):
             one = pd.to_numeric(frame["generator_1"], errors="coerce")

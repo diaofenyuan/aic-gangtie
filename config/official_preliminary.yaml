@@ -50,6 +50,23 @@ data:
     audit_scenarios:
       required: false
 
+# 初赛提交采用 7 天历史 Hampel 检测；全部统计只使用参考时刻以前的数据。
+preprocessing:
+  imputation:
+    method: ffill
+    limit: null
+  outliers:
+    enabled: true
+    method: hampel
+    window: 672
+    min_periods: 96
+    mad_multiplier: 6.0
+    replace_with: median
+
+features:
+  lag_steps: [1, 2, 4, 8, 16, 32, 96, 672]
+  rolling_windows: [4, 8, 16, 32, 96]
+
 forecast:
   short_steps: 8
   model:
@@ -78,17 +95,44 @@ validation:
   rolling_train_points: 3840
 
 recent_validation:
-  folds: 10
+  # 复核阶段保留 8 个近期折，最终逐列门控从中均匀选取 4 折。
+  folds: 8
   validation_points: 192
   step_points: 192
   rolling_train_points: null
 
+# 正式高分档；快速调试请使用 official_preliminary_fast.yaml。
 optuna:
   n_trials: 30
+  n_startup_trials: 10
   top_k: 5
+  coarse_folds: 4
+  strategy: global
+  n_estimators_min: 150
+  n_estimators_max: 750
+  n_estimators_step: 150
+  catboost_iterations_min: 75
+  catboost_iterations_max: 225
+  catboost_iterations_step: 75
+
+model_selection:
+  recent_folds: 4
+  cross_month_folds: 4
+  minimum_non_degraded_folds: 5
+  maximum_worst_degradation: 0.01
 
 submission:
   stage: preliminary
+  archive_name: "咕咕嘎嘎_gas_predict_prelim.zip"
+  quality_normalization:
+    enabled: true
+    drop_constant_columns: true
+    drop_duplicate_columns: true
+    iqr_multiplier: 1.5
+    clip_iqr_multiplier: 1.0
+    iqr_interpolations: [linear, lower, higher, midpoint, nearest]
+    zscore_threshold: 3.0
+    max_iqr_passes: 10
 
 # 评分期文件只作为逐起点预测输入，不读取未来标签或计算本地测试成绩。
 prediction_input:

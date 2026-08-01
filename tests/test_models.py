@@ -107,3 +107,34 @@ def test_boosting_supports_direct_and_global_multistep_strategies() -> None:
         prediction = model.predict(frame, origins, ["generator_1"], [1, 2])
         assert prediction.shape == (2, 2)
         assert np.isfinite(prediction.to_numpy()).all()
+
+
+def test_boosting_uses_constant_regressor_for_constant_residuals() -> None:
+    index = pd.date_range("2025-01-01", periods=100, freq="15min")
+    frame = pd.DataFrame({"generator_1": 42.0}, index=index)
+    builder = CausalFeatureBuilder(
+        feature_config={
+            "lag_steps": [1],
+            "rolling_windows": [4],
+            "rolling_statistics": ["mean"],
+        },
+        roles={"targets": ["generator_1"]},
+    )
+    model = BoostingMultiHorizonModel(
+        backend="catboost",
+        strategy="global",
+        target_mode="residual",
+        feature_builder=builder,
+        baseline_model=LastValueModel(),
+    )
+
+    model.fit(frame, ["generator_1"], [1, 2])
+    prediction = model.predict(
+        frame,
+        pd.DatetimeIndex([index[-1]]),
+        ["generator_1"],
+        [1, 2],
+    )
+
+    assert model.training_metadata_["constant_response_models"] == ["generator_1"]
+    assert np.allclose(prediction.to_numpy(dtype=float), 42.0)

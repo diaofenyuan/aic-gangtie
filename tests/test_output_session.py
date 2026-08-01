@@ -11,7 +11,10 @@ from gas_power.output_session import OutputSession
 
 def test_output_session_uses_completion_time_and_literal_suffix(tmp_path: Path) -> None:
     config = ProjectConfig(
-        raw={"paths": {"root": str(tmp_path), "outputs": "outputs"}},
+        raw={
+            "paths": {"root": str(tmp_path), "outputs": "outputs"},
+            "submission": {"archive_name": "my_team_gas_predict_prelim.zip"},
+        },
         source=tmp_path / "config.yaml",
         root=tmp_path,
     )
@@ -42,7 +45,7 @@ def test_output_session_uses_completion_time_and_literal_suffix(tmp_path: Path) 
         final_directory.name,
     )
     assert (final_directory / "s_result.csv").exists()
-    assert (final_directory / "提交压缩包.zip").exists()
+    assert (final_directory / "my_team_gas_predict_prelim.zip").exists()
 
     relocated = session.relocate_result_paths(
         {"prediction": str(result_file)}, final_directory

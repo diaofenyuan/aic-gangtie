@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any, Mapping
+import hashlib
+import json
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
@@ -39,6 +41,33 @@ def _overall_mape_by_fold(predictions: pd.DataFrame) -> pd.Series:
     return values.groupby("fold", sort=True)["ape"].mean()
 
 
+def select_diverse_trials_for_review(
+    trials: Sequence[Any],
+    top_k: int,
+) -> list[Any]:
+    """优先保留每种参数化的最佳试验，再按总排名补足复核名额。"""
+
+    ranked = sorted(
+        (trial for trial in trials if trial.value is not None),
+        key=lambda item: float(item.value),
+    )
+    family_best: dict[str, Any] = {}
+    for trial in ranked:
+        descriptor = trial.user_attrs.get("candidate_config", {})
+        family = str(descriptor.get("parameterization", "unknown"))
+        family_best.setdefault(family, trial)
+
+    selected = sorted(family_best.values(), key=lambda item: float(item.value))[:top_k]
+    selected_numbers = {int(trial.number) for trial in selected}
+    for trial in ranked:
+        if len(selected) >= top_k:
+            break
+        if int(trial.number) not in selected_numbers:
+            selected.append(trial)
+            selected_numbers.add(int(trial.number))
+    return sorted(selected, key=lambda item: float(item.value))
+
+
 def candidate_config_from_settings(
     config: ProjectConfig,
     *,
@@ -47,24 +76,31 @@ def candidate_config_from_settings(
     half_life_days: int | None,
     parameters: Mapping[str, Any],
     parameterization: str,
+    strategy: str = "direct",
 ) -> ProjectConfig:
+    if strategy not in {"direct", "global"}:
+        raise ValueError("树模型多步策略必须是 direct 或 global")
+    if parameterization not in {"direct", "component", "gas_availability"}:
+        raise ValueError("树模型参数化必须是 direct、component 或 gas_availability")
     raw = deepcopy(config.raw)
     raw["forecast"]["model"] = {
         "type": (
             "component_reconstruction"
             if parameterization == "component"
+            else "gas_availability"
+            if parameterization == "gas_availability"
             else f"residual_{backend}"
         )
     }
     raw["forecast"]["machine_learning"]["backend"] = backend
-    raw["forecast"]["machine_learning"]["strategy"] = "direct"
+    raw["forecast"]["machine_learning"]["strategy"] = strategy
     raw["forecast"]["machine_learning"]["target_mode"] = "residual"
     effective = raw["residual_model"]
     effective.update(
         {
             "enabled": True,
             "backend": backend,
-            "strategy": "direct",
+            "strategy": strategy,
             "baseline": {"type": "last_value"},
             "parameters": dict(parameters),
             "training_window_days": training_window_days,
@@ -130,9 +166,10 @@ def run_tree_search(
     *,
     n_trials: int = 30,
     top_k: int = 5,
+    coarse_folds: int = 4,
     show_progress: bool = False,
 ) -> tuple[list[TunedCandidate], Any]:
-    """先在最近四折粗筛，再对前五组参数执行十折和跨月份复核。"""
+    """按配置预算粗筛树模型，再对排名靠前的候选执行完整复核。"""
 
     prepared.assert_training_allowed()
     try:
@@ -151,8 +188,23 @@ def run_tree_search(
     validation = config.section("validation")
     recent_config = config.raw.get("recent_validation", {})
     recent_config = recent_config if isinstance(recent_config, Mapping) else {}
+    selection_config = config.raw.get("model_selection", {})
+    selection_config = selection_config if isinstance(selection_config, Mapping) else {}
+    optuna_settings = config.raw.get("optuna", {})
+    optuna_settings = optuna_settings if isinstance(optuna_settings, Mapping) else {}
+    strategy = str(optuna_settings.get("strategy", "direct")).lower()
+    if strategy not in {"direct", "global"}:
+        raise ValueError("optuna.strategy 必须是 direct 或 global")
+    if min(int(n_trials), int(top_k), int(coarse_folds)) <= 0:
+        raise ValueError("Optuna 的 n_trials、top_k 和 coarse_folds 必须大于 0")
+    configured_startup_trials = int(
+        optuna_settings.get("n_startup_trials", min(10, int(n_trials)))
+    )
+    if configured_startup_trials < 0:
+        raise ValueError("optuna.n_startup_trials 不得小于 0")
+    startup_trials = min(configured_startup_trials, int(n_trials))
     coarse_splitter = RecentWindowSplitter(
-        folds=4,
+        folds=int(coarse_folds),
         validation_points=int(recent_config.get("validation_points", 192)),
         step_points=int(recent_config.get("step_points", 192)),
         rolling_train_points=(
@@ -166,12 +218,13 @@ def run_tree_search(
         backend = trial.suggest_categorical("backend", ["lightgbm", "catboost"])
         window = trial.suggest_categorical("training_window_days", [30, 60, 90, None])
         half_life = trial.suggest_categorical("half_life_days", [14, 30, 60, None])
-        parameterization = trial.suggest_categorical("parameterization", ["direct", "component"])
-        optuna_settings = config.raw.get("optuna", {})
-        optuna_settings = optuna_settings if isinstance(optuna_settings, Mapping) else {}
-        estimator_min = int(optuna_settings.get("n_estimators_min", 300))
-        estimator_max = int(optuna_settings.get("n_estimators_max", 1200))
-        estimator_step = int(optuna_settings.get("n_estimators_step", 150))
+        parameterization = trial.suggest_categorical(
+            "parameterization", ["direct", "component", "gas_availability"]
+        )
+        parameter_prefix = "catboost_iterations" if backend == "catboost" else "n_estimators"
+        estimator_min = int(optuna_settings.get(f"{parameter_prefix}_min", 300))
+        estimator_max = int(optuna_settings.get(f"{parameter_prefix}_max", 1200))
+        estimator_step = int(optuna_settings.get(f"{parameter_prefix}_step", 150))
         parameters = _trial_parameters_with_backend(
             trial,
             backend,
@@ -182,7 +235,8 @@ def run_tree_search(
         if show_progress:
             tqdm.write(
                 f"开始调参 trial {trial.number + 1}/{int(n_trials)}："
-                f"{backend}，{parameterization}，{parameters['n_estimators' if backend == 'lightgbm' else 'iterations']} 棵树"
+                f"{backend}，{parameterization}，{strategy} 多步，"
+                f"{parameters['n_estimators' if backend == 'lightgbm' else 'iterations']} 棵树"
             )
         candidate_config = candidate_config_from_settings(
             config,
@@ -191,6 +245,7 @@ def run_tree_search(
             half_life_days=half_life,
             parameters=parameters,
             parameterization=parameterization,
+            strategy=strategy,
         )
         artifacts = run_rolling_validation(
             frame=frame,
@@ -213,16 +268,62 @@ def run_tree_search(
             "training_window_days": window,
             "half_life_days": half_life,
             "parameterization": parameterization,
+            "strategy": strategy,
             "parameters": parameters,
         })
         return float(0.8 * scores.mean() + 0.2 * scores.max())
 
-    study = optuna.create_study(direction="minimize", sampler=optuna.samplers.TPESampler(seed=config.seed))
-    study.optimize(objective, n_trials=int(n_trials), show_progress_bar=show_progress)
-    best_trials = sorted(study.trials, key=lambda item: float(item.value))[: int(top_k)]
+    study_signature = {
+        "source": config.source.name,
+        "seed": config.seed,
+        "targets": targets,
+        "horizons": horizons,
+        "features": config.section("features"),
+        "validation": validation,
+        "recent_validation": recent_config,
+        "optuna": optuna_settings,
+        "residual_model": config.raw.get("residual_model", {}),
+        "target_hash": hashlib.sha256(
+            pd.util.hash_pandas_object(frame[targets], index=True).values.tobytes()
+        ).hexdigest(),
+    }
+    study_digest = hashlib.sha256(
+        json.dumps(
+            study_signature,
+            ensure_ascii=True,
+            sort_keys=True,
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()[:16]
+    study_name = f"{config.source.stem}-{study_digest}"
+    storage_path = config.path("cache") / "optuna" / f"{config.source.stem}.sqlite3"
+    storage_path.parent.mkdir(parents=True, exist_ok=True)
+    study = optuna.create_study(
+        direction="minimize",
+        sampler=optuna.samplers.TPESampler(
+            seed=config.seed,
+            n_startup_trials=startup_trials,
+        ),
+        storage=f"sqlite:///{storage_path.as_posix()}",
+        study_name=study_name,
+        load_if_exists=True,
+    )
+    completed_count = sum(trial.value is not None for trial in study.trials)
+    study.optimize(
+        objective,
+        n_trials=max(int(n_trials) - completed_count, 0),
+        show_progress_bar=show_progress,
+        gc_after_trial=True,
+    )
+    completed_trials = [trial for trial in study.trials if trial.value is not None]
+    if len(completed_trials) < int(top_k):
+        raise ValueError(
+            f"Optuna 完成试验数 {len(completed_trials)} 少于复核候选数 {int(top_k)}"
+        )
+    best_trials = select_diverse_trials_for_review(completed_trials, int(top_k))
 
     recent_splitter = RecentWindowSplitter(
-        folds=int(recent_config.get("folds", 10)),
+        folds=int(selection_config.get("recent_folds", recent_config.get("folds", 10))),
         validation_points=int(recent_config.get("validation_points", 192)),
         step_points=int(recent_config.get("step_points", 192)),
         rolling_train_points=(
@@ -230,6 +331,10 @@ def run_tree_search(
             if recent_config.get("rolling_train_points") is not None
             else None
         ),
+    )
+    cross_validation = dict(validation)
+    cross_validation["folds"] = int(
+        selection_config.get("cross_month_folds", validation.get("folds", 8))
     )
     baseline_recent = run_rolling_validation(
         frame=frame,
@@ -270,7 +375,7 @@ def run_tree_search(
         cross = run_rolling_validation(
             frame=frame,
             model_factory=lambda: build_model(candidate_config),
-            splitter=splitter_from_config(validation),
+            splitter=splitter_from_config(cross_validation),
             target_columns=targets,
             horizons=horizons,
             interval_minutes=15,
@@ -496,14 +601,19 @@ def _trial_parameters_with_backend(
     estimator_max: int = 1200,
     estimator_step: int = 150,
 ) -> dict[str, Any]:
+    depth_max = 6 if backend == "catboost" else 10
+    depth_parameter = "catboost_max_depth" if backend == "catboost" else "lightgbm_max_depth"
     common: dict[str, Any] = {
         "learning_rate": trial.suggest_float("learning_rate", 0.015, 0.08, log=True),
-        "max_depth": trial.suggest_int("max_depth", 4, 10),
+        "max_depth": trial.suggest_int(depth_parameter, 4, depth_max),
     }
     if estimator_min <= 0 or estimator_max < estimator_min or estimator_step <= 0:
         raise ValueError("Optuna 树数范围必须满足 min>0、max>=min、step>0")
+    estimator_parameter = (
+        "catboost_iterations" if backend == "catboost" else "lightgbm_n_estimators"
+    )
     estimators = trial.suggest_int(
-        "n_estimators", estimator_min, estimator_max, step=estimator_step
+        estimator_parameter, estimator_min, estimator_max, step=estimator_step
     )
     if backend == "lightgbm":
         common.update(

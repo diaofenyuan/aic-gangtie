@@ -1,0 +1,15 @@
+# 初赛快速调试档：数据和模型逻辑与高分档一致，仅压缩搜索预算。
+extends: official_preliminary.yaml
+
+optuna:
+  n_trials: 8
+  n_startup_trials: 4
+  top_k: 2
+  coarse_folds: 2
+  strategy: global
+  n_estimators_min: 150
+  n_estimators_max: 450
+  n_estimators_step: 150
+  catboost_iterations_min: 75
+  catboost_iterations_max: 150
+  catboost_iterations_step: 75

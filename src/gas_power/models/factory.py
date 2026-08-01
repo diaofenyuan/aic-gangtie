@@ -18,7 +18,10 @@ from gas_power.models.baselines import (
 )
 from gas_power.models.boosting import BoostingMultiHorizonModel
 from gas_power.models.ensemble import WeightedEnsembleModel
-from gas_power.models.parameterization import ComponentReconstructionModel
+from gas_power.models.parameterization import (
+    ComponentReconstructionModel,
+    GasAvailabilityForecastModel,
+)
 from gas_power.models.deep import NeuralResidualMultiHorizonModel
 
 
@@ -112,6 +115,7 @@ def build_model(config: ProjectConfig) -> ForecastModel:
         "residual_lightgbm",
         "residual_catboost",
         "component_reconstruction",
+        "gas_availability",
     }:
         machine_learning = forecast.get("machine_learning", {})
         if not isinstance(machine_learning, Mapping):
@@ -124,11 +128,12 @@ def build_model(config: ProjectConfig) -> ForecastModel:
             availability=FeatureAvailabilityRegistry.from_config(config),
             model_scope="long",
         )
-        residual = model_type.startswith("residual_")
+        gas_parameterized = model_type == "gas_availability"
+        residual = model_type.startswith("residual_") or gas_parameterized
         parameterized = model_type == "component_reconstruction"
         backend = (
             str(machine_learning.get("backend", "lightgbm"))
-            if parameterized
+            if parameterized or gas_parameterized
             else model_type.removeprefix("residual_")
         )
         residual_config = config.raw.get("residual_model", {})
@@ -160,6 +165,12 @@ def build_model(config: ProjectConfig) -> ForecastModel:
         )
         if parameterized:
             return ComponentReconstructionModel(base_model, builder)
+        if gas_parameterized:
+            return GasAvailabilityForecastModel(
+                base_model,
+                builder,
+                interval_minutes=interval_minutes,
+            )
         return base_model
     if model_type in {"tcn", "patchtst"}:
         deep = forecast.get("deep_learning", {})

@@ -20,6 +20,7 @@ class OutputSession:
 
     output_root: Path
     staging_directory: Path
+    archive_name: str
 
     @classmethod
     def start(cls, config: ProjectConfig) -> "OutputSession":
@@ -28,10 +29,25 @@ class OutputSession:
         staging_directory = output_root / f".running-{uuid4().hex}"
         staging_directory.mkdir(parents=False, exist_ok=False)
 
+        submission = config.raw.get("submission", {})
+        archive_name = (
+            str(submission.get("archive_name", "teamname_gas_predict_prelim.zip"))
+            if isinstance(submission, dict)
+            else "teamname_gas_predict_prelim.zip"
+        )
+        if Path(archive_name).name != archive_name or not archive_name.lower().endswith(
+            ".zip"
+        ):
+            raise ValueError("submission.archive_name 必须是不含目录的 .zip 文件名")
+
         paths = config.section("paths")
         paths["results"] = str(staging_directory)
         paths["reports"] = str(staging_directory / "reports")
-        return cls(output_root=output_root, staging_directory=staging_directory)
+        return cls(
+            output_root=output_root,
+            staging_directory=staging_directory,
+            archive_name=archive_name,
+        )
 
     def finalize(self) -> tuple[Path, datetime]:
         """用运行结束时刻生成最终目录名，并原子移动本次结果。"""
@@ -67,7 +83,7 @@ class OutputSession:
         if (self.staging_directory / FREEZE_MANIFEST).is_file():
             verify_submission_freeze(self.staging_directory)
 
-        archive_path = self.staging_directory / "提交压缩包.zip"
+        archive_path = self.staging_directory / self.archive_name
         with ZipFile(
             archive_path,
             mode="w",

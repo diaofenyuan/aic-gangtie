@@ -57,7 +57,7 @@ outputs/2026-07-31_02-10-30预测结果/
 ├── input.csv
 ├── submission_freeze.json        # 提交文件 SHA-256 冻结清单
 ├── 运行结果.json                 # 终端摘要对应的完整结构化结果
-├── 提交压缩包.zip               # ZIP 根目录仅包含 input.csv 和 s_result.csv
+├── teamname_gas_predict_prelim.zip # ZIP 根目录仅包含 input.csv 和 s_result.csv
 └── reports/
 ```
 
@@ -177,7 +177,7 @@ python -m src.cli --config config/default.yaml benchmark
 
 物理后处理支持非负、容量、可配置逐步爬坡及 `generator_1 <= generator_all`。回测会把约束前后指标分别写入本次运行的 `outputs/<完成时间>预测结果/reports/postprocessing_metrics.csv`，不默认假设约束一定改善准确率。
 
-`tune` 只读取训练目录，先用最近 4 折 Optuna 粗筛，再对树模型前 5 组和深度模型前 2 组执行 10 个最近两天折及 8 个跨月份折。选择指标为最近折平均/最差和跨月份平均的加权组合；候选必须在原始标签上平均改善至少 0.3 个百分点、两个目标均不退化、至少 7/10 折改善且最差折退化不超过 0.5 个百分点。未通过的候选不会进入 OOF 融合，最终自动回退到 `LastValueModel`。融合权重按目标×步长使用非负 NNLS，并以留一折预测重新门控。
+`tune` 只读取训练目录。`config/official_preliminary.yaml` 是高分档：30 次 Optuna trial、最近 4 折粗筛、复核前 5 组参数，树数范围为 150–750；`config/official_preliminary_fast.yaml` 保留 8 次 trial、2 折粗筛和前 2 组复核，用于快速排错。候选包含直接残差模型、机组分解模型和“煤气产量/优先消耗/气柜变化 -> 可用煤气 -> 发电量”两阶段模型。最终从近期验证和跨月份验证各均匀选取 4 折，按目标×步长独立检查平均改善、至少 5/8 折不退化及最差折退化不超过 1 个百分点；合格候选使用非负 NNLS 和留一折预测融合，不合格的单列独立回退 `LastValueModel`，不再由整模门槛否决所有步长。
 
 `scoring` 不是验证集。它只能在 `predict` 阶段按起点拼接训练尾部 672 点历史；评分期后续行不会进入拟合、OOF、早停、特征选择或融合调权。`reports/high_accuracy_selection.json`、模型元数据和 SHA-256 清单记录这一边界。
 
@@ -227,16 +227,16 @@ python -m src.cli --config config/default.yaml benchmark
 ## 输出文件
 
 - `outputs/<完成时间>预测结果/s_result.csv`：`datetime` + 两个目标的 t+15 至 t+120，共 17 列；
-- `outputs/<完成时间>预测结果/input.csv`：192 个预测起点、29 个官方原始字段及所有 `feat_` 因果派生特征；
-- `outputs/<完成时间>预测结果/提交压缩包.zip`：ZIP 根目录仅包含原名 `input.csv` 和 `s_result.csv`；
+- `outputs/<完成时间>预测结果/input.csv`：192 个预测起点、训练期有效的官方原始字段及经过训练期常数/重复裁剪的 `feat_` 因果派生特征；
+- `outputs/<完成时间>预测结果/teamname_gas_predict_prelim.zip`：ZIP 根目录仅包含原名 `input.csv` 和 `s_result.csv`；
 - `outputs/<完成时间>预测结果/submission_freeze.json`：两个提交文件的 SHA-256 与字节数；
 - `outputs/<完成时间>预测结果/reports/resource_boundary_forecast.csv`：三类煤气发生量、优先需求、储气前可用量、历史发电基准和电价的 96 步预测；
 - `outputs/<完成时间>预测结果/reports/inference_runtime.json`：单样本和总推理耗时，并检查题面建议的单样本 30 秒、总计 30 分钟限制；
 - `outputs/<完成时间>预测结果/submission_manifest.json`：源码/config 哈希、模型训练区间、字段白名单、文件哈希与校验结果。
 
-写出前后都会检查时间戳是否为预测起点、列名及顺序、步长完整性、目标互换、缺行/重复/错位、意外索引列、数值类型、缺失/无穷值、容量边界和 UTF-8 编码。`input.csv` 保留 29 个官方原始字段，所有派生字段统一使用 `feat_` 前缀。ZIP 打包前会再次校验冻结哈希。
+写出前后都会检查时间戳是否为预测起点、列名及顺序、步长完整性、目标互换、缺行/重复/错位、意外索引列、数值类型、缺失/无穷值、容量边界和 UTF-8 编码。`input.csv` 剔除训练期全缺失原始字段，缺失和异常值只用历史观测因果修复，所有派生字段统一使用 `feat_` 前缀。ZIP 打包前会再次校验冻结哈希。
 
-提交压缩包按初赛截图要求固定打包 `input.csv` 和 `s_result.csv`，文件名保持不变且不增加额外目录层级。
+提交压缩包按初赛要求固定打包 `input.csv` 和 `s_result.csv`，压缩包名称由 `submission.archive_name` 配置且不增加额外目录层级。
 
 ## GPU 与深度模型
 

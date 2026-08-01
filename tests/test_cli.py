@@ -43,7 +43,7 @@ def test_console_summary_is_compact_and_uses_chinese_labels() -> None:
             "origins": 1,
             "runtime": {"total_inference_seconds": 9.278},
         },
-        "submission_archive": "outputs/提交压缩包.zip",
+        "submission_archive": "outputs/teamname_gas_predict_prelim.zip",
         "result_file": "outputs/运行结果.json",
         "output_directory": "outputs/预测结果",
     }
