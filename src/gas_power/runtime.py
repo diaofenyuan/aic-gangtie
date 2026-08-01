@@ -4,13 +4,27 @@ from __future__ import annotations
 
 import os
 from collections.abc import Iterable, Iterator
-from typing import TypeVar
+from typing import Any, TypeVar
 
 from gas_power.config import ProjectConfig
 
 
 WORKERS_ENV = "GAS_POWER_WORKERS"
 T = TypeVar("T")
+
+
+def progress_bar(
+    iterable: Iterable[T] | None = None,
+    **options: Any,
+) -> Any:
+    """创建一条阶段进度行，阶段内部通过状态文本原地刷新。"""
+
+    from tqdm.auto import tqdm
+
+    options.setdefault("dynamic_ncols", True)
+    options.setdefault("position", 0)
+    options.setdefault("mininterval", 0.2)
+    return tqdm(iterable, **options)
 
 
 def resolve_worker_count(config: ProjectConfig, override: int | None = None) -> int:
@@ -77,10 +91,8 @@ def track_progress(
 ) -> Iterator[T]:
     """使用统一样式包装可迭代任务。"""
 
-    from tqdm.auto import tqdm
-
     return iter(
-        tqdm(
+        progress_bar(
             iterable,
             total=total,
             desc=description,

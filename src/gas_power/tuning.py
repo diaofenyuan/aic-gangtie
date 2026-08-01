@@ -10,7 +10,6 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
-from tqdm.auto import tqdm
 
 from gas_power.config import ProjectConfig
 from gas_power.data import PreparedForecastData
@@ -18,6 +17,7 @@ from gas_power.ensemble_selection import CandidateGate, evaluate_candidate_gate
 from gas_power.features import CausalFeatureBuilder
 from gas_power.models.baselines import LastValueModel
 from gas_power.models.factory import build_model
+from gas_power.runtime import progress_bar
 from gas_power.validation import RecentWindowSplitter, run_rolling_validation, splitter_from_config
 
 
@@ -214,6 +214,12 @@ def run_tree_search(
         ),
     )
 
+    search_progress = None
+
+    def update_search_status(status: str) -> None:
+        if search_progress is not None:
+            search_progress.set_postfix_str(status, refresh=True)
+
     def objective(trial: Any) -> float:
         backend = trial.suggest_categorical("backend", ["lightgbm", "catboost"])
         window = trial.suggest_categorical("training_window_days", [30, 60, 90, None])
@@ -232,12 +238,14 @@ def run_tree_search(
             estimator_max=estimator_max,
             estimator_step=estimator_step,
         )
-        if show_progress:
-            tqdm.write(
-                f"开始调参 trial {trial.number + 1}/{int(n_trials)}："
-                f"{backend}，{parameterization}，{strategy} 多步，"
-                f"{parameters['n_estimators' if backend == 'lightgbm' else 'iterations']} 棵树"
-            )
+        estimator_count = parameters[
+            "n_estimators" if backend == "lightgbm" else "iterations"
+        ]
+        trial_label = (
+            f"trial {trial.number + 1}/{int(n_trials)} | {backend} | "
+            f"{parameterization} | {strategy} 多步 | {estimator_count} 棵树"
+        )
+        update_search_status(trial_label)
         candidate_config = candidate_config_from_settings(
             config,
             backend=backend,
@@ -259,8 +267,11 @@ def run_tree_search(
             raw_targets=prepared.raw_targets,
             feature_matrix=cached_features,
             data_source=prepared.source,
-            show_progress=show_progress,
+            show_progress=False,
             progress_description=f"调参 trial {trial.number + 1}/{int(n_trials)} 粗筛",
+            progress_callback=lambda status: update_search_status(
+                f"{trial_label} | {status}"
+            ),
         )
         scores = _overall_mape_by_fold(artifacts.predictions)
         trial.set_user_attr("candidate_config", {
@@ -271,7 +282,11 @@ def run_tree_search(
             "strategy": strategy,
             "parameters": parameters,
         })
-        return float(0.8 * scores.mean() + 0.2 * scores.max())
+        objective_value = float(0.8 * scores.mean() + 0.2 * scores.max())
+        update_search_status(f"{trial_label} | MAPE {float(scores.mean()):.6f}")
+        if search_progress is not None:
+            search_progress.update(1)
+        return objective_value
 
     study_signature = {
         "source": config.source.name,
@@ -309,12 +324,28 @@ def run_tree_search(
         load_if_exists=True,
     )
     completed_count = sum(trial.value is not None for trial in study.trials)
-    study.optimize(
-        objective,
-        n_trials=max(int(n_trials) - completed_count, 0),
-        show_progress_bar=show_progress,
-        gc_after_trial=True,
+    remaining_trials = max(int(n_trials) - completed_count, 0)
+    search_progress = progress_bar(
+        total=int(n_trials),
+        initial=completed_count,
+        desc="树模型搜索",
+        unit="轮",
+        leave=True,
+        disable=not show_progress,
     )
+    search_progress.set_postfix_str(
+        f"已恢复 {completed_count} 轮 | 待运行 {remaining_trials} 轮",
+        refresh=True,
+    )
+    try:
+        study.optimize(
+            objective,
+            n_trials=remaining_trials,
+            show_progress_bar=False,
+            gc_after_trial=True,
+        )
+    finally:
+        search_progress.close()
     completed_trials = [trial for trial in study.trials if trial.value is not None]
     if len(completed_trials) < int(top_k):
         raise ValueError(
@@ -463,11 +494,6 @@ def run_deep_search(
     for architecture in architectures:
         for context_steps in contexts:
             candidate_index += 1
-            if show_progress:
-                tqdm.write(
-                    f"开始深度候选 {candidate_index}/{candidate_total}："
-                    f"{architecture}，上下文 {context_steps} 步"
-                )
             descriptor = {
                 "kind": "deep",
                 "architecture": architecture,

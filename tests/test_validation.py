@@ -50,6 +50,7 @@ def test_rolling_validation_reports_target_horizon_and_worst_conditions() -> Non
             "gas_holder": {"blast_furnace": "holder"},
         },
     )
+    progress_updates: list[str] = []
     artifacts = run_rolling_validation(
         frame=frame,
         model_factory=LastValueModel,
@@ -60,8 +61,11 @@ def test_rolling_validation_reports_target_horizon_and_worst_conditions() -> Non
         near_zero_threshold=1.0e-6,
         worst_error_count=10,
         feature_builder=builder,
+        progress_callback=progress_updates.append,
     )
     assert len(artifacts.predictions) == 2 * 20 * 2 * 3
     assert "target_horizon" in set(artifacts.metrics["scope"])
     assert "feat_gas_balance_blast_furnace" in artifacts.worst_errors.columns
+    assert any("第 1/2 折" in status for status in progress_updates)
+    assert any("本折完成" in status for status in progress_updates)
 

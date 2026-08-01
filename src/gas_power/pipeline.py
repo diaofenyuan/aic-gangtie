@@ -13,7 +13,6 @@ from typing import Any, Mapping
 import joblib
 import numpy as np
 import pandas as pd
-from tqdm.auto import tqdm
 
 from gas_power.audit import calculate_lag_correlations, run_data_audit
 from gas_power.availability import FeatureAvailabilityRegistry
@@ -59,7 +58,7 @@ from gas_power.postprocessing import (
     compare_postprocessing_metrics,
 )
 from gas_power.relations import discover_relations
-from gas_power.runtime import progress_enabled, track_progress
+from gas_power.runtime import progress_bar, progress_enabled, track_progress
 from gas_power.scoring import ConfigurableScorer
 from gas_power.submission import validate_submission_bundle
 from gas_power.submission_freeze import freeze_submission
@@ -248,12 +247,12 @@ def prepare_prepared_data(
     loader = ConfiguredDataLoader(config)
     builder = _feature_builder(config)
     cache_steps = 3
-    with tqdm(
+    with progress_bar(
         total=loader.progress_steps() + builder.progress_steps() + cache_steps,
         desc="数据准备",
         unit="项",
         dynamic_ncols=True,
-        leave=False,
+        leave=True,
         disable=not progress_enabled(config),
         mininterval=0.2,
     ) as data_progress:

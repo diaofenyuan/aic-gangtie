@@ -7,10 +7,10 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
-from tqdm.auto import tqdm
 
 from gas_power.metrics import official_mape, summarize_predictions
 from gas_power.models.factory import baseline_from_spec
+from gas_power.runtime import progress_bar
 from gas_power.validation import TimeSeriesRollingSplitter, run_rolling_validation
 
 
@@ -104,13 +104,13 @@ def run_baseline_benchmark(
 ) -> BenchmarkArtifacts:
     metric_parts: list[pd.DataFrame] = []
     prediction_parts: list[pd.DataFrame] = []
-    baseline_iterator = tqdm(
+    baseline_iterator = progress_bar(
         baseline_specs,
         total=len(baseline_specs),
         desc="基线评测",
         unit="模型",
         dynamic_ncols=True,
-        leave=False,
+        leave=True,
         disable=not show_progress,
     )
     for spec in baseline_iterator:

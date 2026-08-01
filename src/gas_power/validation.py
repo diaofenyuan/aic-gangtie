@@ -8,11 +8,11 @@ from typing import Callable, Mapping, Sequence
 import numpy as np
 import pandas as pd
 from pandas.testing import assert_frame_equal
-from tqdm.auto import tqdm
 
 from gas_power.features import CausalFeatureBuilder, LeakageError
 from gas_power.metrics import largest_errors, summarize_predictions
 from gas_power.models.base import ForecastModel, prediction_column
+from gas_power.runtime import progress_bar
 from gas_power.time_semantics import validate_target_times
 
 
@@ -194,6 +194,7 @@ def run_rolling_validation(
     raw_targets: pd.DataFrame | None = None,
     feature_matrix: pd.DataFrame | None = None,
     data_source: str = "training",
+    progress_callback: Callable[[str], None] | None = None,
 ) -> ValidationArtifacts:
     if data_source == "scoring":
         raise LeakageError("评分期 scoring 数据禁止用于滚动验证或模型选择")
@@ -224,33 +225,45 @@ def run_rolling_validation(
 
     tidy_rows: list[dict[str, object]] = []
     offset = pd.Timedelta(minutes=interval_minutes)
-    split_iterator = tqdm(
-        splits,
-        total=len(splits),
-        desc=progress_description,
-        unit="折",
-        dynamic_ncols=True,
-        leave=False,
-        disable=not show_progress,
+    local_progress = (
+        progress_bar(
+            splits,
+            total=len(splits),
+            desc=progress_description,
+            unit="折",
+            leave=True,
+            disable=not show_progress,
+        )
+        if progress_callback is None
+        else None
     )
+    split_iterator = local_progress if local_progress is not None else splits
     for split in split_iterator:
         model = model_factory()
         training = frame.loc[split.train_start : split.train_end]
         fit_steps = model.fit_progress_steps(target_columns, horizons)
-        fit_progress = tqdm(
-            total=fit_steps,
-            desc=f"{progress_description} 第 {split.fold + 1}/{len(splits)} 折训练",
-            unit="步",
-            dynamic_ncols=True,
-            leave=False,
-            disable=not show_progress or fit_steps is None,
-        )
+        fit_completed = 0
+
+        def report_status(label: str) -> None:
+            status = f"第 {split.fold + 1}/{len(splits)} 折 | {label}"
+            if progress_callback is not None:
+                progress_callback(status)
+            elif local_progress is not None:
+                local_progress.set_postfix_str(status, refresh=True)
 
         def advance_fit(label: str) -> None:
-            fit_progress.set_postfix_str(label, refresh=False)
-            fit_progress.update(1)
+            nonlocal fit_completed
+            fit_completed += 1
+            step = (
+                f"训练 {fit_completed}/{fit_steps}"
+                if fit_steps is not None
+                else "训练中"
+            )
+            report_status(f"{step} | {label}")
 
-        model.set_fit_progress_callback(advance_fit if show_progress else None)
+        report_status("准备训练")
+        visible_callback = show_progress or progress_callback is not None
+        model.set_fit_progress_callback(advance_fit if visible_callback else None)
         try:
             model.fit(
                 training,
@@ -267,7 +280,7 @@ def run_rolling_validation(
             )
         finally:
             model.set_fit_progress_callback(None)
-            fit_progress.close()
+        report_status("训练完成，正在预测")
         predictions = model.predict(frame, split.validation_origins, target_columns, horizons)
         if split.fold == 0:
             assert_model_causality(
@@ -302,6 +315,11 @@ def run_rolling_validation(
                     row["condition_month_change"] = int(pd.Timestamp(origin).month != target_time.month)
                     row["condition_weekend"] = int(pd.Timestamp(origin).dayofweek >= 5)
                     tidy_rows.append(row)
+
+        report_status("本折完成")
+
+    if local_progress is not None:
+        local_progress.close()
 
     tidy = pd.DataFrame(tidy_rows)
     validate_target_times(
