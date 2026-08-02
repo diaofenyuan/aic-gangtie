@@ -39,12 +39,14 @@ from gas_power.environment import check_high_accuracy_environment
 from gas_power.gpu_gate import evaluate_gpu_gate, evaluate_residual_gate
 from gas_power.models import build_model
 from gas_power.models.base import prediction_column, prediction_columns
-from gas_power.models.baselines import DampedTrendModel, LastValueModel
+from gas_power.models.baselines import LastValueModel
 from gas_power.models.factory import baseline_from_spec
-from gas_power.models.ensemble import HorizonWeightedEnsembleModel
+from gas_power.models.ensemble import HourlyCalibratedModel, HorizonWeightedEnsembleModel
 from gas_power.ensemble_selection import (
     apply_oof_weights,
+    cross_fit_hourly_mape_calibration,
     evaluate_oof_column_gate,
+    fit_hourly_mape_calibration,
     fit_oof_weights,
 )
 from gas_power.optimization import (
@@ -396,6 +398,12 @@ def tune_pipeline(config: ProjectConfig) -> dict[str, Any]:
     cross_selection_folds = int(selection.get("cross_month_folds", 4))
     minimum_non_degraded = int(selection.get("minimum_non_degraded_folds", 5))
     maximum_worst_degradation = float(selection.get("maximum_worst_degradation", 0.01))
+    fold_group_weights = selection.get("fold_group_weights", {})
+    fold_group_weights = (
+        {str(prefix): float(weight) for prefix, weight in fold_group_weights.items()}
+        if isinstance(fold_group_weights, Mapping)
+        else {}
+    )
     recent_config = config.raw.get("recent_validation", {})
     recent_config = recent_config if isinstance(recent_config, Mapping) else {}
     splitter = RecentWindowSplitter(
@@ -437,39 +445,6 @@ def tune_pipeline(config: ProjectConfig) -> dict[str, Any]:
         feature_matrix=features,
         data_source=prepared.source,
     )
-    def trend_factory() -> DampedTrendModel:
-        return DampedTrendModel(
-            window=5,
-            damping=0.85,
-            interval_minutes=15,
-        )
-    trend = run_rolling_validation(
-        frame=prepared.model_input,
-        model_factory=trend_factory,
-        splitter=splitter,
-        target_columns=targets,
-        horizons=horizons,
-        interval_minutes=15,
-        near_zero_threshold=float(validation.get("near_zero_threshold", 1.0e-6)),
-        worst_error_count=50,
-        raw_targets=prepared.raw_targets,
-        feature_matrix=features,
-        data_source=prepared.source,
-    )
-    trend_cross = run_rolling_validation(
-        frame=prepared.model_input,
-        model_factory=trend_factory,
-        splitter=splitter_from_config(cross_validation),
-        target_columns=targets,
-        horizons=horizons,
-        interval_minutes=15,
-        near_zero_threshold=float(validation.get("near_zero_threshold", 1.0e-6)),
-        worst_error_count=50,
-        raw_targets=prepared.raw_targets,
-        feature_matrix=features,
-        data_source=prepared.source,
-    )
-
     baseline_selection = _combine_selection_predictions(
         baseline.predictions,
         baseline_cross.predictions,
@@ -487,25 +462,69 @@ def tune_pipeline(config: ProjectConfig) -> dict[str, Any]:
     oof = baseline_selection[keys + ["y_true", "y_pred", *condition_columns]].rename(
         columns={"y_pred": "last_value"}
     )
-    trend_selection = _combine_selection_predictions(
-        trend.predictions,
-        trend_cross.predictions,
-        recent_folds=recent_selection_folds,
-        cross_month_folds=cross_selection_folds,
+    configured_baselines = selection.get("baseline_candidates", [])
+    baseline_specs = (
+        configured_baselines
+        if isinstance(configured_baselines, list) and configured_baselines
+        else [{"name": "damped_trend", "type": "damped_trend", "window": 5, "damping": 0.85}]
     )
-    oof = oof.merge(
-        trend_selection[keys + ["y_pred"]].rename(columns={"y_pred": "damped_trend"}),
-        on=keys,
-        how="inner",
-        validate="one_to_one",
-    )
-    _assert_selection_fold_coverage(
-        oof,
-        recent_folds=recent_selection_folds,
-        cross_month_folds=cross_selection_folds,
-        context="基线与趋势模型",
-    )
-    component_builders: dict[str, Any] = {"damped_trend": trend_factory}
+    component_builders: dict[str, Any] = {}
+    for baseline_index, raw_spec in enumerate(baseline_specs, start=1):
+        if not isinstance(raw_spec, Mapping):
+            raise ValueError("model_selection.baseline_candidates 必须由字典组成")
+        spec = dict(raw_spec)
+        name = str(spec.pop("name", f"baseline_{baseline_index}"))
+        if name == "last_value" or name in component_builders:
+            raise ValueError(f"基线候选名称重复或保留名称被占用: {name}")
+
+        def baseline_factory(item: dict[str, Any] = spec):
+            return baseline_from_spec(item, 15)
+
+        recent_baseline = run_rolling_validation(
+            frame=prepared.model_input,
+            model_factory=baseline_factory,
+            splitter=splitter,
+            target_columns=targets,
+            horizons=horizons,
+            interval_minutes=15,
+            near_zero_threshold=float(validation.get("near_zero_threshold", 1.0e-6)),
+            worst_error_count=50,
+            raw_targets=prepared.raw_targets,
+            feature_matrix=features,
+            data_source=prepared.source,
+        )
+        cross_baseline = run_rolling_validation(
+            frame=prepared.model_input,
+            model_factory=baseline_factory,
+            splitter=splitter_from_config(cross_validation),
+            target_columns=targets,
+            horizons=horizons,
+            interval_minutes=15,
+            near_zero_threshold=float(validation.get("near_zero_threshold", 1.0e-6)),
+            worst_error_count=50,
+            raw_targets=prepared.raw_targets,
+            feature_matrix=features,
+            data_source=prepared.source,
+        )
+        selection_predictions = _combine_selection_predictions(
+            recent_baseline.predictions,
+            cross_baseline.predictions,
+            recent_folds=recent_selection_folds,
+            cross_month_folds=cross_selection_folds,
+        )
+        oof = oof.merge(
+            selection_predictions[keys + ["y_pred"]].rename(columns={"y_pred": name}),
+            on=keys,
+            how="inner",
+            validate="one_to_one",
+        )
+        _assert_selection_fold_coverage(
+            oof,
+            recent_folds=recent_selection_folds,
+            cross_month_folds=cross_selection_folds,
+            context=f"基线候选 {name}",
+        )
+        component_builders[name] = baseline_factory
     component_configs: dict[str, ProjectConfig] = {}
     for candidate_index, candidate in enumerate(candidates, start=1):
         name = f"candidate_{candidate_index}_trial_{candidate.trial_number}"
@@ -561,11 +580,13 @@ def tune_pipeline(config: ProjectConfig) -> dict[str, Any]:
                 )
                 if candidate_gate.passed:
                     eligible.append(name)
+            # 激进策略：优先使用ML模型，降低last_value权重
             weights, loo = fit_oof_weights(
                 oof,
                 eligible,
                 target_column=target,
                 horizon=horizon,
+                fold_group_weights=fold_group_weights,
             )
             if not loo.empty:
                 loo.insert(0, "target", target)
@@ -618,6 +639,62 @@ def tune_pipeline(config: ProjectConfig) -> dict[str, Any]:
 
     if fused_loo["y_pred"].isna().any():
         raise ValueError("留一折融合预测未覆盖全部 OOF 样本")
+    calibration_settings = selection.get("hourly_calibration", {})
+    calibration_settings = (
+        calibration_settings if isinstance(calibration_settings, Mapping) else {}
+    )
+    accepted_calibrations: dict[str, dict[str, float]] = {}
+    calibrated_loo = fused_loo.copy()
+    if bool(calibration_settings.get("enabled", False)):
+        fit_settings = {
+            "hour_bin_size": int(calibration_settings.get("hour_bin_size", 4)),
+            "minimum_samples": int(calibration_settings.get("minimum_samples", 24)),
+            "shrinkage": float(calibration_settings.get("shrinkage", 48.0)),
+            "minimum_factor": float(calibration_settings.get("minimum_factor", 0.90)),
+            "maximum_factor": float(calibration_settings.get("maximum_factor", 1.10)),
+            "interval_minutes": 15,
+        }
+        candidate_calibration = cross_fit_hourly_mape_calibration(
+            fused_loo, **fit_settings
+        )
+        all_calibrations = fit_hourly_mape_calibration(fused_loo, **fit_settings)
+        calibration_gate_folds = int(
+            calibration_settings.get("minimum_non_degraded_folds", minimum_non_degraded)
+        )
+        calibration_worst = float(
+            calibration_settings.get("maximum_worst_degradation", 0.005)
+        )
+        for target in targets:
+            for horizon in horizons:
+                mask = (fused_loo["target"] == target) & (
+                    fused_loo["horizon_steps"] == horizon
+                )
+                calibration_frame = fused_loo.assign(
+                    uncalibrated=fused_loo["y_pred"],
+                    calibrated=candidate_calibration,
+                )
+                calibration_gate = evaluate_oof_column_gate(
+                    calibration_frame,
+                    target_column=target,
+                    horizon=horizon,
+                    candidate_column="calibrated",
+                    baseline_column="uncalibrated",
+                    minimum_non_degraded_folds=calibration_gate_folds,
+                    maximum_worst_degradation=calibration_worst,
+                )
+                column_gate_rows.append(
+                    {
+                        "target": target,
+                        "horizon_steps": horizon,
+                        "candidate": "hourly_calibration",
+                        "gate_type": "calibration",
+                        **calibration_gate.to_dict(),
+                    }
+                )
+                prediction_name = prediction_column(target, horizon)
+                if calibration_gate.passed and prediction_name in all_calibrations:
+                    calibrated_loo.loc[mask, "y_pred"] = candidate_calibration.loc[mask]
+                    accepted_calibrations[prediction_name] = all_calibrations[prediction_name]
     accepted_columns = sum(
         any(name != "last_value" and weight > 0.0 for name, weight in weights.items())
         for weights in column_weights.values()
@@ -641,6 +718,14 @@ def tune_pipeline(config: ProjectConfig) -> dict[str, Any]:
     else:
         final_model = LastValueModel()
         selected_status = "FALLBACK_LAST_VALUE"
+    if accepted_calibrations:
+        final_model = HourlyCalibratedModel(
+            final_model,
+            accepted_calibrations,
+            hour_bin_size=int(calibration_settings.get("hour_bin_size", 4)),
+            interval_minutes=15,
+        )
+        selected_status = f"{selected_status}_HOURLY_CALIBRATED"
     final_model.fit(
         prepared.model_input,
         targets,
@@ -676,6 +761,12 @@ def tune_pipeline(config: ProjectConfig) -> dict[str, Any]:
         index=False,
         encoding="utf-8",
     )
+    if accepted_calibrations:
+        calibrated_loo.to_csv(
+            reports / "high_accuracy_calibrated_leave_one_fold.csv",
+            index=False,
+            encoding="utf-8",
+        )
     if loo_parts:
         pd.concat(loo_parts, ignore_index=True).to_csv(
             reports / "high_accuracy_leave_one_fold.csv", index=False, encoding="utf-8"
@@ -685,7 +776,7 @@ def tune_pipeline(config: ProjectConfig) -> dict[str, Any]:
         reports / "high_accuracy_column_gates.csv", index=False, encoding="utf-8"
     )
     diagnostic_predictions = oof[keys + ["y_true", *condition_columns]].copy()
-    diagnostic_predictions["y_pred"] = fused_loo["y_pred"].to_numpy(dtype=float)
+    diagnostic_predictions["y_pred"] = calibrated_loo["y_pred"].to_numpy(dtype=float)
     largest_errors, error_groups = _large_error_reports(diagnostic_predictions)
     largest_errors.to_csv(
         reports / "high_accuracy_large_errors.csv", index=False, encoding="utf-8"
@@ -702,6 +793,8 @@ def tune_pipeline(config: ProjectConfig) -> dict[str, Any]:
         "cross_month_folds": cross_selection_folds,
         "minimum_non_degraded_folds": minimum_non_degraded,
         "maximum_worst_degradation": maximum_worst_degradation,
+        "fold_group_weights": fold_group_weights,
+        "hourly_calibrated_columns": len(accepted_calibrations),
     }
     model_hash = hashlib.sha256(model_path.read_bytes()).hexdigest()
     metadata = {
@@ -718,6 +811,7 @@ def tune_pipeline(config: ProjectConfig) -> dict[str, Any]:
         "fusion_gate": fusion_summary,
         "column_gates": column_gate_rows,
         "weights": column_weights,
+        "hourly_calibration": accepted_calibrations,
         "model_sha256": model_hash,
         "optuna_best_value": float(study.best_value),
         "optuna_trials": len(study.trials),
@@ -1053,6 +1147,46 @@ def _load_scoring_prepared(config: ProjectConfig) -> PreparedForecastData:
     return prepared
 
 
+def _local_score_payload(
+    scorer: ConfigurableScorer,
+    predictions: pd.DataFrame,
+) -> dict[str, Any]:
+    score = scorer.score(predictions).to_dict()
+    display_scale = float(score["display_scale"])
+    score["score_percent"] = float(score["final_score"]) / display_scale * 100.0
+    return score
+
+
+def _selection_oof_local_entries(
+    path: Path,
+    scorer: ConfigurableScorer,
+) -> dict[str, dict[str, Any]]:
+    """读取融合模型留一折预测，生成不使用评分期标签的主本地分数。"""
+
+    if not path.exists():
+        return {}
+    predictions = pd.read_csv(path, encoding="utf-8")
+    required = {"fold", "target", "horizon_steps", "y_true", "y_pred"}
+    missing = required.difference(predictions.columns)
+    if missing:
+        raise ValueError(f"融合模型留一折报告缺少字段: {sorted(missing)}")
+    entries: dict[str, dict[str, Any]] = {}
+    for name, prefix, label in (
+        ("cross_month", "cross_month_", "跨月份训练期留一折融合验证"),
+        ("recent", "recent_", "近期训练期留一折融合验证"),
+    ):
+        subset = predictions.loc[predictions["fold"].astype(str).str.startswith(prefix)]
+        if subset.empty:
+            continue
+        entries[name] = {
+            "label": label,
+            "folds": int(subset["fold"].nunique()),
+            "prediction_pairs": len(subset),
+            "score": _local_score_payload(scorer, subset),
+        }
+    return entries
+
+
 def validate_pipeline(config: ProjectConfig) -> dict[str, Any]:
     prepared, features, _ = prepare_prepared_data(config)
     prepared.assert_training_allowed()
@@ -1130,6 +1264,58 @@ def validate_pipeline(config: ProjectConfig) -> dict[str, Any]:
         recent_artifacts.predictions.to_csv(
             results_dir / "recent_validation_predictions.csv", index=False, encoding="utf-8"
         )
+
+    # 本地评分仅使用训练期滚动验证的原始标签，不能替代赛事平台的正式评分。
+    score_config = dict(config.section("scoring"))
+    score_config["data_processing"] = {"enabled": False}
+    scorer = ConfigurableScorer(score_config)
+
+    baseline_reference: dict[str, Any] = {
+        "cross_month": {
+            "label": "配置基线跨月份滚动验证",
+            "folds": len(artifacts.splits),
+            "prediction_pairs": len(artifacts.predictions),
+            "score": _local_score_payload(scorer, artifacts.predictions),
+        },
+    }
+    if recent_artifacts is not None:
+        baseline_reference["recent"] = {
+            "label": "配置基线最近窗口滚动验证",
+            "folds": len(recent_artifacts.splits),
+            "prediction_pairs": len(recent_artifacts.predictions),
+            "score": _local_score_payload(scorer, recent_artifacts.predictions),
+        }
+    selection_entries = _selection_oof_local_entries(
+        config.path("reports", "reports") / "high_accuracy_fused_leave_one_fold.csv",
+        scorer,
+    )
+    decision_source = (
+        "CROSS_FITTED_SELECTION_OOF"
+        if {"cross_month", "recent"}.issubset(selection_entries)
+        else "CONFIGURED_BASELINE_ROLLING_VALIDATION"
+    )
+    primary_entries = (
+        selection_entries
+        if decision_source == "CROSS_FITTED_SELECTION_OOF"
+        else baseline_reference
+    )
+    local_score: dict[str, Any] = {
+        "label": "本地回测评分",
+        "official_score": False,
+        "notice": (
+            "主分数来自训练期留一折融合预测，不使用评分期标签；仍不代表赛事平台正式成绩。"
+            if decision_source == "CROSS_FITTED_SELECTION_OOF"
+            else "仅基于训练期原始标签的滚动验证，不代表赛事平台正式成绩。"
+        ),
+        "scoring_data_used": False,
+        "decision_source": decision_source,
+        **primary_entries,
+    }
+    if decision_source == "CROSS_FITTED_SELECTION_OOF":
+        local_score["configured_baseline_reference"] = baseline_reference
+    local_score_path = results_dir / "本地评分.json"
+    _write_json(local_score, local_score_path)
+
     split_payload = [
         {
             "fold": split.fold,
@@ -1147,6 +1333,7 @@ def validate_pipeline(config: ProjectConfig) -> dict[str, Any]:
         "prediction_pairs": len(artifacts.predictions),
         "metrics_rows": len(artifacts.metrics),
         "metric_files_generated": True,
+        "local_score": {**local_score, "file": str(local_score_path)},
         "warning": _data_notice(config),
         "leakage_checks": "passed",
         "validation_protocol": {
@@ -1154,6 +1341,7 @@ def validate_pipeline(config: ProjectConfig) -> dict[str, Any]:
             "recent_folds": len(recent_artifacts.splits) if recent_artifacts is not None else 0,
             "raw_labels": True,
             "scoring_used": False,
+            "local_score_decision_source": decision_source,
         },
     }
 

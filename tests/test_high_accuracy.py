@@ -21,9 +21,12 @@ from gas_power.data import (
     prepare_scoring_with_history,
     sanitize_submission_features,
 )
-from gas_power.ensemble_selection import evaluate_oof_column_gate
 from gas_power.ensemble_selection import (
     apply_oof_weights,
+    cross_fit_hourly_mape_calibration,
+    evaluate_oof_column_gate,
+    fit_oof_weights,
+    fit_hourly_mape_calibration,
     mape_sample_weights,
     project_forecasts,
 )
@@ -39,7 +42,9 @@ from gas_power.models.parameterization import (
 from gas_power.pipeline import (
     _assert_selection_fold_coverage,
     _combine_selection_predictions,
+    _selection_oof_local_entries,
 )
+from gas_power.scoring import ConfigurableScorer
 from gas_power.tuning import candidate_config_from_settings, select_diverse_trials_for_review
 from gas_power.validation import RecentWindowSplitter, run_rolling_validation
 
@@ -529,6 +534,41 @@ def test_column_gate_accepts_stable_per_horizon_gain_without_whole_model_gate() 
     assert gate.non_degraded_folds == 6
 
 
+def test_hourly_calibration_is_cross_fitted_and_reduces_stable_bias() -> None:
+    rows: list[dict[str, object]] = []
+    for fold in range(6):
+        for hour in range(0, 24, 2):
+            rows.append(
+                {
+                    "fold": fold,
+                    "target": "generator_all",
+                    "horizon_steps": 4,
+                    "target_datetime": pd.Timestamp("2025-01-01")
+                    + pd.Timedelta(days=fold, hours=hour),
+                    "y_true": 105.0,
+                    "y_pred": 100.0,
+                }
+            )
+    predictions = pd.DataFrame(rows)
+
+    calibrated = cross_fit_hourly_mape_calibration(
+        predictions,
+        hour_bin_size=4,
+        minimum_samples=2,
+        shrinkage=0.0,
+    )
+    factors = fit_hourly_mape_calibration(
+        predictions,
+        hour_bin_size=4,
+        minimum_samples=2,
+        shrinkage=0.0,
+    )
+
+    assert np.allclose(calibrated.to_numpy(dtype=float), 105.0)
+    assert set(factors) == {"generator_all_t+60_pred"}
+    assert all(np.isclose(value, 1.05) for value in factors["generator_all_t+60_pred"].values())
+
+
 def test_selection_fold_combination_requires_aligned_four_plus_four_folds() -> None:
     def predictions(folds: int) -> pd.DataFrame:
         return pd.DataFrame(
@@ -580,6 +620,93 @@ def test_review_selection_keeps_best_trial_from_each_parameterization() -> None:
     selected = select_diverse_trials_for_review(trials, top_k=5)
 
     assert [trial.number for trial in selected] == [0, 1, 2, 3, 4]
+
+
+def test_review_selection_keeps_target_and_column_specialists() -> None:
+    trials = [
+        SimpleNamespace(
+            number=0,
+            value=0.040,
+            user_attrs={
+                "candidate_config": {"parameterization": "component", "strategy": "direct"},
+                "target_mape": {"generator_1": 0.060, "generator_all": 0.020},
+                "column_mape": {"generator_1_h1": 0.060, "generator_all_h1": 0.020},
+            },
+        ),
+        SimpleNamespace(
+            number=1,
+            value=0.041,
+            user_attrs={
+                "candidate_config": {"parameterization": "direct", "strategy": "direct"},
+                "target_mape": {"generator_1": 0.030, "generator_all": 0.052},
+                "column_mape": {"generator_1_h1": 0.030, "generator_all_h1": 0.052},
+            },
+        ),
+        SimpleNamespace(
+            number=2,
+            value=0.042,
+            user_attrs={
+                "candidate_config": {"parameterization": "direct", "strategy": "global"},
+                "target_mape": {"generator_1": 0.045, "generator_all": 0.018},
+                "column_mape": {"generator_1_h1": 0.045, "generator_all_h1": 0.018},
+            },
+        ),
+    ]
+
+    selected = select_diverse_trials_for_review(trials, top_k=3)
+
+    assert {trial.number for trial in selected} == {0, 1, 2}
+
+
+def test_recent_fold_weight_moves_fusion_toward_recent_specialist() -> None:
+    oof = pd.DataFrame(
+        {
+            "fold": ["recent_0"] * 4 + ["cross_month_0"] * 4,
+            "target": ["generator_1"] * 8,
+            "horizon_steps": [1] * 8,
+            "y_true": [100.0] * 8,
+            "baseline": [110.0] * 4 + [100.0] * 4,
+            "recent_specialist": [100.0] * 4 + [110.0] * 4,
+        }
+    )
+
+    equal, _ = fit_oof_weights(
+        oof,
+        ["baseline", "recent_specialist"],
+        target_column="generator_1",
+        horizon=1,
+    )
+    aggressive, _ = fit_oof_weights(
+        oof,
+        ["baseline", "recent_specialist"],
+        target_column="generator_1",
+        horizon=1,
+        fold_group_weights={"recent_": 3.0, "cross_month_": 1.0},
+    )
+
+    assert aggressive[1] > equal[1]
+
+
+def test_selection_oof_entries_replace_baseline_score_source(tmp_path: Path) -> None:
+    path = tmp_path / "selection.csv"
+    pd.DataFrame(
+        {
+            "fold": ["recent_0", "cross_month_0"],
+            "target": ["generator_1", "generator_1"],
+            "horizon_steps": [1, 1],
+            "y_true": [100.0, 100.0],
+            "y_pred": [98.0, 96.0],
+        }
+    ).to_csv(path, index=False)
+
+    entries = _selection_oof_local_entries(
+        path,
+        ConfigurableScorer({"formula": "one_minus_mape"}),
+    )
+
+    assert entries["recent"]["folds"] == 1
+    assert entries["recent"]["score"]["score_percent"] == pytest.approx(98.0)
+    assert entries["cross_month"]["score"]["score_percent"] == pytest.approx(96.0)
 
 
 @pytest.mark.parametrize("architecture", ["tcn", "patchtst"])

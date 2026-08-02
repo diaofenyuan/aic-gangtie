@@ -55,3 +55,37 @@ def test_console_summary_is_compact_and_uses_chinese_labels() -> None:
     assert "训练：最后值保持模型" in summary
     assert "泄漏检查通过" in summary
     assert "不应输出到摘要" not in summary
+
+
+def test_console_summary_prints_local_score_last() -> None:
+    result = {
+        "validate": {
+            "folds": 8,
+            "leakage_checks": "passed",
+            "local_score": {
+                "official_score": False,
+                "cross_month": {
+                    "score": {
+                        "final_score": 0.936443,
+                        "display_scale": 1.0,
+                        "score_percent": 93.6443,
+                    }
+                },
+                "recent": {
+                    "score": {
+                        "final_score": 0.951728,
+                        "display_scale": 1.0,
+                        "score_percent": 95.1728,
+                    }
+                },
+            },
+        },
+        "output_directory": "outputs/预测结果",
+    }
+
+    summary = _format_console_summary("run", result)
+
+    assert summary.splitlines()[-2:] == [
+        "本地得分：93.644300 分（跨月份训练期滚动验证，非官方榜分）",
+        "近期得分：95.172800 分（近期训练期滚动验证，非官方榜分）",
+    ]

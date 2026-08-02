@@ -14,3 +14,6 @@ logs/
 outputs/
 reports/
 tmp/
+
+# 本地运行日志不进入版本控制
+*.log

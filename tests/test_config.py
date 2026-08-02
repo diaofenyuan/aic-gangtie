@@ -74,19 +74,22 @@ def test_official_tuning_budget_is_bounded_and_keeps_full_month_validation() -> 
     config = load_config(PROJECT_ROOT / "config" / "official_preliminary.yaml")
     tuning = config.section("optuna")
 
-    assert tuning["n_trials"] == 30
-    assert tuning["n_startup_trials"] == 10
-    assert tuning["top_k"] == 5
-    assert tuning["coarse_folds"] == 4
-    assert tuning["strategy"] == "global"
+    assert tuning["n_trials"] == 10
+    assert tuning["n_startup_trials"] == 6
+    assert tuning["top_k"] == 4
+    assert tuning["coarse_folds"] == 2
+    assert tuning["timeout_seconds"] == 1500
+    assert tuning["strategy"] == "mixed"
     assert tuning["n_estimators_min"] == 150
     assert tuning["n_estimators_max"] == 750
     assert tuning["catboost_iterations_max"] == 225
+    assert config.raw["model_selection"]["fold_group_weights"]["recent_"] == 3.0
+    assert config.raw["model_selection"]["hourly_calibration"]["enabled"] is False
     assert config.section("recent_validation")["folds"] == 8
     assert config.section("validation")["folds"] == 8
 
     fast = load_config(PROJECT_ROOT / "config" / "official_preliminary_fast.yaml")
-    assert fast.section("optuna")["n_trials"] == 8
+    assert fast.section("optuna")["n_trials"] == 4
     assert fast.section("optuna")["top_k"] == 2
     assert fast.section("optuna")["coarse_folds"] == 2
 

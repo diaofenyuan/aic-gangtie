@@ -115,6 +115,27 @@ def _format_console_summary(command: str, result: dict[str, Any]) -> str:
     output_directory = result.get("output_directory")
     if output_directory:
         lines.append(f"输出目录：{output_directory}")
+
+    if validation is not None:
+        local_score = validation.get("local_score")
+        if isinstance(local_score, dict):
+            for section_name, label, protocol in (
+                ("cross_month", "本地得分", "跨月份训练期滚动验证"),
+                ("recent", "近期得分", "近期训练期滚动验证"),
+            ):
+                section = local_score.get(section_name)
+                score = section.get("score") if isinstance(section, dict) else None
+                if not isinstance(score, dict):
+                    continue
+                score_percent = score.get("score_percent")
+                if score_percent is None and "final_score" in score:
+                    display_scale = float(score.get("display_scale", 1.0))
+                    score_percent = float(score["final_score"]) / display_scale * 100.0
+                if score_percent is not None:
+                    lines.append(
+                        f"{label}：{float(score_percent):.6f} 分"
+                        f"（{protocol}，非官方榜分）"
+                    )
     return "\n".join(lines)
 
 

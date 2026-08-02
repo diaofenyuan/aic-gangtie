@@ -72,12 +72,25 @@ def mape_sample_weights(
     return weights / max(normalizer, minimum_floor)
 
 
-def _nnls_weights(actual: np.ndarray, predictions: np.ndarray) -> np.ndarray:
+def _nnls_weights(
+    actual: np.ndarray,
+    predictions: np.ndarray,
+    sample_weights: np.ndarray | None = None,
+) -> np.ndarray:
     if predictions.ndim != 2 or predictions.shape[1] == 0:
         raise ValueError("OOF 预测矩阵必须为二维且至少包含一个候选")
     denominator = np.maximum(np.abs(actual), 1.0e-6)
     scaled_actual = actual / denominator
     scaled_predictions = predictions / denominator[:, None]
+    if sample_weights is not None:
+        row_weights = np.asarray(sample_weights, dtype=float)
+        if row_weights.shape != actual.shape:
+            raise ValueError("OOF 样本权重长度与标签不一致")
+        if (row_weights <= 0.0).any() or not np.isfinite(row_weights).all():
+            raise ValueError("OOF 样本权重必须为有限正数")
+        scale = np.sqrt(row_weights)
+        scaled_actual = scaled_actual * scale
+        scaled_predictions = scaled_predictions * scale[:, None]
     try:
         from scipy.optimize import nnls
 
@@ -99,6 +112,7 @@ def fit_oof_weights(
     target_column: str,
     horizon: int,
     fold_column: str = "fold",
+    fold_group_weights: Mapping[str, float] | None = None,
 ) -> tuple[np.ndarray, pd.DataFrame]:
     """按目标×步长拟合非负、和为一的 OOF 权重，并返回留一折结果。"""
 
@@ -117,7 +131,16 @@ def fit_oof_weights(
     subset = subset.loc[finite]
     actual = subset["y_true"].to_numpy(dtype=float)
     matrix = subset[list(model_names)].to_numpy(dtype=float)
-    weights = _nnls_weights(actual, matrix)
+
+    def row_weights(values: pd.DataFrame) -> np.ndarray:
+        weights = np.ones(len(values), dtype=float)
+        for prefix, weight in (fold_group_weights or {}).items():
+            weights[
+                values[fold_column].astype(str).str.startswith(str(prefix)).to_numpy()
+            ] = float(weight)
+        return weights
+
+    weights = _nnls_weights(actual, matrix, row_weights(subset))
     loo_rows: list[dict[str, object]] = []
     for fold, held_out in subset.groupby(fold_column, sort=True):
         train = subset.loc[subset[fold_column] != fold]
@@ -126,6 +149,7 @@ def fit_oof_weights(
         loo = _nnls_weights(
             train["y_true"].to_numpy(dtype=float),
             train[list(model_names)].to_numpy(dtype=float),
+            row_weights(train),
         )
         pred = held_out[list(model_names)].to_numpy(dtype=float) @ loo
         denominator = np.maximum(np.abs(held_out["y_true"].to_numpy(dtype=float)), 1.0e-6)
@@ -154,6 +178,110 @@ def apply_oof_weights(
     output = matrix @ normalized
     if not np.isfinite(output).all():
         raise ValueError("融合预测包含缺失值或无穷值")
+    return output
+
+
+def _weighted_median(values: np.ndarray, weights: np.ndarray) -> float:
+    order = np.argsort(values)
+    sorted_values = values[order]
+    sorted_weights = weights[order]
+    cutoff = 0.5 * float(sorted_weights.sum())
+    position = int(np.searchsorted(np.cumsum(sorted_weights), cutoff, side="left"))
+    return float(sorted_values[min(position, len(sorted_values) - 1)])
+
+
+def fit_hourly_mape_calibration(
+    predictions: pd.DataFrame,
+    *,
+    prediction_column_name: str = "y_pred",
+    hour_bin_size: int = 4,
+    minimum_samples: int = 24,
+    shrinkage: float = 48.0,
+    minimum_factor: float = 0.90,
+    maximum_factor: float = 1.10,
+    interval_minutes: int = 15,
+) -> dict[str, dict[str, float]]:
+    """按目标、步长和目标时段拟合 MAPE 对齐的稳健乘法校准。"""
+
+    required = {"target", "horizon_steps", "target_datetime", "y_true", prediction_column_name}
+    missing = required.difference(predictions.columns)
+    if missing:
+        raise ValueError(f"分时校准数据缺少字段: {sorted(missing)}")
+    if hour_bin_size <= 0 or 24 % int(hour_bin_size) != 0:
+        raise ValueError("hour_bin_size 必须是 24 的正约数")
+    values = predictions.copy()
+    values["hour_bin"] = (
+        pd.to_datetime(values["target_datetime"]).dt.hour // int(hour_bin_size)
+    ).astype(int)
+    calibrations: dict[str, dict[str, float]] = {}
+    for (target, horizon, hour_bin), group in values.groupby(
+        ["target", "horizon_steps", "hour_bin"], sort=True
+    ):
+        actual = pd.to_numeric(group["y_true"], errors="coerce").to_numpy(dtype=float)
+        predicted = pd.to_numeric(
+            group[prediction_column_name], errors="coerce"
+        ).to_numpy(dtype=float)
+        finite = np.isfinite(actual) & np.isfinite(predicted) & (np.abs(predicted) > 1.0e-6)
+        actual = actual[finite]
+        predicted = predicted[finite]
+        if len(actual) < int(minimum_samples):
+            continue
+        ratios = actual / predicted
+        weights = np.abs(predicted) / np.maximum(np.abs(actual), 1.0e-6)
+        finite_ratio = np.isfinite(ratios) & np.isfinite(weights) & (weights > 0.0)
+        if int(finite_ratio.sum()) < int(minimum_samples):
+            continue
+        raw_factor = _weighted_median(ratios[finite_ratio], weights[finite_ratio])
+        confidence = len(actual) / (len(actual) + max(float(shrinkage), 0.0))
+        factor = 1.0 + confidence * (raw_factor - 1.0)
+        factor = float(np.clip(factor, minimum_factor, maximum_factor))
+        column = f"{target}_t+{int(horizon) * int(interval_minutes)}_pred"
+        calibrations.setdefault(column, {})[str(int(hour_bin))] = factor
+    return calibrations
+
+
+def apply_hourly_mape_calibration(
+    predictions: pd.DataFrame,
+    calibrations: Mapping[str, Mapping[str, float]],
+    *,
+    source_column: str = "y_pred",
+    hour_bin_size: int = 4,
+    interval_minutes: int = 15,
+) -> pd.Series:
+    """将训练期学得的分时乘法因子应用到整洁格式预测。"""
+
+    output = pd.to_numeric(predictions[source_column], errors="coerce").copy()
+    target_hours = pd.to_datetime(predictions["target_datetime"]).dt.hour
+    for index in predictions.index:
+        target = str(predictions.at[index, "target"])
+        horizon = int(predictions.at[index, "horizon_steps"])
+        column = f"{target}_t+{horizon * int(interval_minutes)}_pred"
+        hour_bin = str(int(target_hours.loc[index]) // int(hour_bin_size))
+        factor = float(calibrations.get(column, {}).get(hour_bin, 1.0))
+        output.loc[index] = float(output.loc[index]) * factor
+    return output
+
+
+def cross_fit_hourly_mape_calibration(
+    predictions: pd.DataFrame,
+    *,
+    fold_column: str = "fold",
+    **settings: object,
+) -> pd.Series:
+    """每个时间折仅使用其他折拟合校准，返回无折内标签污染的预测。"""
+
+    output = pd.Series(np.nan, index=predictions.index, dtype=float)
+    for fold, held_out in predictions.groupby(fold_column, sort=True):
+        training = predictions.loc[predictions[fold_column] != fold]
+        calibrations = fit_hourly_mape_calibration(training, **settings)
+        output.loc[held_out.index] = apply_hourly_mape_calibration(
+            held_out,
+            calibrations,
+            hour_bin_size=int(settings.get("hour_bin_size", 4)),
+            interval_minutes=int(settings.get("interval_minutes", 15)),
+        )
+    if output.isna().any():
+        raise ValueError("交叉拟合分时校准未覆盖全部 OOF 样本")
     return output
 
 
@@ -230,9 +358,9 @@ def evaluate_candidate_gate(
     *,
     target_column: str = "target",
     fold_column: str = "fold",
-    minimum_mean_gain: float = 0.003,
-    maximum_worst_degradation: float = 0.005,
-    minimum_improved_folds: int = 7,
+    minimum_mean_gain: float = 0.001,
+    maximum_worst_degradation: float = 0.015,
+    minimum_improved_folds: int = 3,
 ) -> CandidateGate:
     """使用原始标签比较候选和最后值基线，返回可审计门控结果。"""
 
@@ -258,13 +386,15 @@ def evaluate_candidate_gate(
     recent_worst_gain = float(fold_scores["gain"].min())
     improved_folds = int((fold_scores["gain"] > 0.0).sum())
     target_gains = {str(index): float(value) for index, value in target_scores["gain"].items()}
+    # 门槛不得超过实际折数，否则折数少于门槛时永远无法通过。
+    required_folds = min(int(minimum_improved_folds), len(fold_scores))
     reasons: list[str] = []
     if recent_mean_gain < minimum_mean_gain:
         reasons.append(f"最近折平均改善不足 {minimum_mean_gain:.4f}")
     if any(value < 0.0 for value in target_gains.values()):
         reasons.append("至少一个目标退化")
-    if improved_folds < minimum_improved_folds:
-        reasons.append(f"改善折数不足 {minimum_improved_folds}")
+    if improved_folds < required_folds:
+        reasons.append(f"改善折数不足 {required_folds}")
     if recent_worst_gain < -maximum_worst_degradation:
         reasons.append(f"最差折退化超过 {maximum_worst_degradation:.4f}")
     return CandidateGate(

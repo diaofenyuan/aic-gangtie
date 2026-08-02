@@ -41,30 +41,114 @@ def _overall_mape_by_fold(predictions: pd.DataFrame) -> pd.Series:
     return values.groupby("fold", sort=True)["ape"].mean()
 
 
+def _mape_diagnostics(predictions: pd.DataFrame) -> tuple[dict[str, float], dict[str, float]]:
+    """记录粗筛候选的逐目标、逐预测列 MAPE，供专家候选选择使用。"""
+
+    values = predictions.copy()
+    denominator = np.maximum(np.abs(values["y_true"].to_numpy(dtype=float)), 1.0e-6)
+    values["ape"] = np.abs(values["y_pred"] - values["y_true"]) / denominator
+    target_scores = {
+        str(target): float(score)
+        for target, score in values.groupby("target", sort=True)["ape"].mean().items()
+    }
+    column_scores = {
+        f"{target}_h{int(horizon)}": float(score)
+        for (target, horizon), score in values.groupby(
+            ["target", "horizon_steps"], sort=True
+        )["ape"].mean().items()
+    }
+    return target_scores, column_scores
+
+
 def select_diverse_trials_for_review(
     trials: Sequence[Any],
     top_k: int,
 ) -> list[Any]:
-    """优先保留每种参数化的最佳试验，再按总排名补足复核名额。"""
+    """兼顾整体最优、目标专家、预测列专家和模型族多样性。"""
 
     ranked = sorted(
         (trial for trial in trials if trial.value is not None),
         key=lambda item: float(item.value),
     )
+    if not ranked or top_k <= 0:
+        return []
+
+    selected: list[Any] = []
+    selected_numbers: set[int] = set()
+
+    def add(trial: Any) -> None:
+        number = int(trial.number)
+        if len(selected) < int(top_k) and number not in selected_numbers:
+            selected.append(trial)
+            selected_numbers.add(number)
+
+    # 整体最优必须保留，避免专家选择牺牲全部列的共同收益。
+    add(ranked[0])
+
+    target_names = sorted(
+        {
+            str(target)
+            for trial in ranked
+            for target in trial.user_attrs.get("target_mape", {})
+        }
+    )
+    # 先处理当前更难的目标，使有限复核名额优先覆盖短板。
+    target_names.sort(
+        key=lambda target: float(ranked[0].user_attrs.get("target_mape", {}).get(target, 0.0)),
+        reverse=True,
+    )
+    for target in target_names:
+        eligible = [
+            trial for trial in ranked if target in trial.user_attrs.get("target_mape", {})
+        ]
+        if eligible:
+            add(
+                min(
+                    eligible,
+                    key=lambda trial: float(trial.user_attrs["target_mape"][target]),
+                )
+            )
+
+    column_wins: dict[int, int] = {}
+    for column in sorted(
+        {
+            str(column)
+            for trial in ranked
+            for column in trial.user_attrs.get("column_mape", {})
+        }
+    ):
+        eligible = [
+            trial for trial in ranked if column in trial.user_attrs.get("column_mape", {})
+        ]
+        if not eligible:
+            continue
+        winner = min(
+            eligible,
+            key=lambda trial: float(trial.user_attrs["column_mape"][column]),
+        )
+        column_wins[int(winner.number)] = column_wins.get(int(winner.number), 0) + 1
+    for trial in sorted(
+        ranked,
+        key=lambda item: (-column_wins.get(int(item.number), 0), float(item.value)),
+    ):
+        if column_wins.get(int(trial.number), 0) > 0:
+            add(trial)
+
     family_best: dict[str, Any] = {}
     for trial in ranked:
         descriptor = trial.user_attrs.get("candidate_config", {})
-        family = str(descriptor.get("parameterization", "unknown"))
+        family = "|".join(
+            (
+                str(descriptor.get("parameterization", "unknown")),
+                str(descriptor.get("strategy", "unknown")),
+            )
+        )
         family_best.setdefault(family, trial)
 
-    selected = sorted(family_best.values(), key=lambda item: float(item.value))[:top_k]
-    selected_numbers = {int(trial.number) for trial in selected}
+    for trial in sorted(family_best.values(), key=lambda item: float(item.value)):
+        add(trial)
     for trial in ranked:
-        if len(selected) >= top_k:
-            break
-        if int(trial.number) not in selected_numbers:
-            selected.append(trial)
-            selected_numbers.add(int(trial.number))
+        add(trial)
     return sorted(selected, key=lambda item: float(item.value))
 
 
@@ -192,9 +276,9 @@ def run_tree_search(
     selection_config = selection_config if isinstance(selection_config, Mapping) else {}
     optuna_settings = config.raw.get("optuna", {})
     optuna_settings = optuna_settings if isinstance(optuna_settings, Mapping) else {}
-    strategy = str(optuna_settings.get("strategy", "direct")).lower()
-    if strategy not in {"direct", "global"}:
-        raise ValueError("optuna.strategy 必须是 direct 或 global")
+    configured_strategy = str(optuna_settings.get("strategy", "direct")).lower()
+    if configured_strategy not in {"direct", "global", "mixed"}:
+        raise ValueError("optuna.strategy 必须是 direct、global 或 mixed")
     if min(int(n_trials), int(top_k), int(coarse_folds)) <= 0:
         raise ValueError("Optuna 的 n_trials、top_k 和 coarse_folds 必须大于 0")
     configured_startup_trials = int(
@@ -222,6 +306,11 @@ def run_tree_search(
 
     def objective(trial: Any) -> float:
         backend = trial.suggest_categorical("backend", ["lightgbm", "catboost"])
+        strategy = (
+            trial.suggest_categorical("strategy", ["global", "direct"])
+            if configured_strategy == "mixed"
+            else configured_strategy
+        )
         window = trial.suggest_categorical("training_window_days", [30, 60, 90, None])
         half_life = trial.suggest_categorical("half_life_days", [14, 30, 60, None])
         parameterization = trial.suggest_categorical(
@@ -231,6 +320,11 @@ def run_tree_search(
         estimator_min = int(optuna_settings.get(f"{parameter_prefix}_min", 300))
         estimator_max = int(optuna_settings.get(f"{parameter_prefix}_max", 1200))
         estimator_step = int(optuna_settings.get(f"{parameter_prefix}_step", 150))
+        if strategy == "direct":
+            estimator_max = min(
+                estimator_max,
+                int(optuna_settings.get(f"direct_{parameter_prefix}_max", estimator_max)),
+            )
         parameters = _trial_parameters_with_backend(
             trial,
             backend,
@@ -274,6 +368,7 @@ def run_tree_search(
             ),
         )
         scores = _overall_mape_by_fold(artifacts.predictions)
+        target_mape, column_mape = _mape_diagnostics(artifacts.predictions)
         trial.set_user_attr("candidate_config", {
             "backend": backend,
             "training_window_days": window,
@@ -282,6 +377,8 @@ def run_tree_search(
             "strategy": strategy,
             "parameters": parameters,
         })
+        trial.set_user_attr("target_mape", target_mape)
+        trial.set_user_attr("column_mape", column_mape)
         objective_value = float(0.8 * scores.mean() + 0.2 * scores.max())
         update_search_status(f"{trial_label} | MAPE {float(scores.mean()):.6f}")
         if search_progress is not None:
@@ -298,6 +395,7 @@ def run_tree_search(
         "recent_validation": recent_config,
         "optuna": optuna_settings,
         "residual_model": config.raw.get("residual_model", {}),
+        "trial_diagnostics_version": 2,
         "target_hash": hashlib.sha256(
             pd.util.hash_pandas_object(frame[targets], index=True).values.tobytes()
         ).hexdigest(),
@@ -341,6 +439,11 @@ def run_tree_search(
         study.optimize(
             objective,
             n_trials=remaining_trials,
+            timeout=(
+                float(optuna_settings["timeout_seconds"])
+                if optuna_settings.get("timeout_seconds") is not None
+                else None
+            ),
             show_progress_bar=False,
             gc_after_trial=True,
         )
@@ -423,10 +526,11 @@ def run_tree_search(
         recent_scores = _overall_mape_by_fold(recent.predictions)
         cross_scores = _overall_mape_by_fold(cross.predictions)
         gate = evaluate_candidate_gate(baseline_recent.predictions, recent.predictions)
+        # 激进策略：更重视近期平均和最佳折，降低最差折权重
         selection = float(
-            0.7 * recent_scores.mean()
-            + 0.2 * recent_scores.max()
-            + 0.1 * cross_scores.mean()
+            0.75 * recent_scores.mean()  # 增加近期平均权重
+            + 0.15 * recent_scores.max()  # 降低最差折权重
+            + 0.10 * cross_scores.mean()  # 保持跨月权重
         )
         completed.append(
             TunedCandidate(
@@ -607,9 +711,9 @@ def run_deep_search(
                 recent_worst_mape=float(recent_scores.max()),
                 cross_month_mape=float(cross_scores.mean()),
                 selection_metric=float(
-                    0.7 * recent_scores.mean()
-                    + 0.2 * recent_scores.max()
-                    + 0.1 * cross_scores.mean()
+                    0.75 * recent_scores.mean()  # 激进策略：优先近期平均
+                    + 0.15 * recent_scores.max()
+                    + 0.10 * cross_scores.mean()
                 ),
                 gate=gate,
                 recent_predictions=recent.predictions,

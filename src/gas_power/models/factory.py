@@ -12,6 +12,7 @@ from gas_power.models.baselines import (
     DampedTrendModel,
     LastValueModel,
     LinearTrendModel,
+    SeasonalMedianModel,
     SeasonalNaiveModel,
     WindowMeanModel,
     WindowMedianModel,
@@ -50,6 +51,12 @@ def baseline_from_spec(spec: Mapping[str, Any], interval_minutes: int) -> Foreca
     if model_type == "seasonal_naive":
         return SeasonalNaiveModel(
             period_steps=int(spec.get("period_steps", 96)),
+            interval_minutes=interval_minutes,
+        )
+    if model_type == "seasonal_median":
+        return SeasonalMedianModel(
+            period_steps=int(spec.get("period_steps", 96)),
+            seasons=int(spec.get("seasons", 3)),
             interval_minutes=interval_minutes,
         )
     if model_type == "weighted_ensemble":
@@ -106,6 +113,7 @@ def build_model(config: ProjectConfig) -> ForecastModel:
         "linear_trend",
         "damped_trend",
         "seasonal_naive",
+        "seasonal_median",
     }:
         return baseline_from_spec(model_spec, interval_minutes)
 

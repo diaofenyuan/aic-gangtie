@@ -47,6 +47,10 @@ def test_synthetic_end_to_end_in_isolated_directory(tmp_path: Path) -> None:
     config = load_config(config_path)
     result = demo_pipeline(config)
     assert result["validate"]["leakage_checks"] == "passed"
+    local_score = result["validate"]["local_score"]
+    assert local_score["official_score"] is False
+    assert local_score["scoring_data_used"] is False
+    assert 0.0 <= local_score["cross_month"]["score"]["score_percent"] <= 100.0
     assert result["optimize"]["diagnostics"]["success"] is True
     assert result["optimize"]["diagnostics"]["priority_mode"] == "lexicographic"
 
@@ -63,6 +67,7 @@ def test_synthetic_end_to_end_in_isolated_directory(tmp_path: Path) -> None:
     ]
     validate_optimization_frame(opt, gas_columns)
     assert (results_dir / "optimization_diagnostics.json").exists()
+    assert (results_dir / "本地评分.json").exists()
     assert (results_dir / "reports" / "resource_boundary_forecast.csv").exists()
     unit_plan = pd.read_csv(results_dir / "optimization_unit_plan.csv", encoding="utf-8")
     assert {"generator_1_plan_mw", "generator_all_plan_mw"}.issubset(unit_plan.columns)

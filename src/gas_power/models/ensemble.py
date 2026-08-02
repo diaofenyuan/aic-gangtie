@@ -7,7 +7,7 @@ from typing import Mapping, Sequence
 import numpy as np
 import pandas as pd
 
-from gas_power.models.base import ForecastModel
+from gas_power.models.base import ForecastModel, prediction_column
 
 
 class WeightedEnsembleModel(ForecastModel):
@@ -141,4 +141,82 @@ class HorizonWeightedEnsembleModel(ForecastModel):
             )
         if not np.isfinite(output.to_numpy(dtype=float)).all():
             raise ValueError("OOF 融合结果包含缺失值或无穷值")
+        return output
+
+
+class HourlyCalibratedModel(ForecastModel):
+    """使用训练期交叉验证筛选出的目标时段乘法因子校准预测。"""
+
+    def __init__(
+        self,
+        base_model: ForecastModel,
+        calibrations: Mapping[str, Mapping[str, float]],
+        *,
+        hour_bin_size: int = 4,
+        interval_minutes: int = 15,
+    ):
+        self.base_model = base_model
+        self.calibrations = {
+            str(column): {str(hour_bin): float(factor) for hour_bin, factor in bins.items()}
+            for column, bins in calibrations.items()
+        }
+        self.hour_bin_size = int(hour_bin_size)
+        self.interval_minutes = int(interval_minutes)
+
+    def fit(
+        self,
+        frame: pd.DataFrame,
+        target_columns: Sequence[str],
+        horizons: Sequence[int],
+        train_end: pd.Timestamp | None = None,
+        *,
+        raw_targets: pd.DataFrame | None = None,
+        feature_matrix: pd.DataFrame | None = None,
+        data_source: str = "training",
+    ) -> "HourlyCalibratedModel":
+        self.base_model.fit(
+            frame,
+            target_columns,
+            horizons,
+            train_end=train_end,
+            raw_targets=raw_targets,
+            feature_matrix=feature_matrix,
+            data_source=data_source,
+        )
+        return self
+
+    def fit_progress_steps(
+        self, target_columns: Sequence[str], horizons: Sequence[int]
+    ) -> int | None:
+        return self.base_model.fit_progress_steps(target_columns, horizons)
+
+    def set_fit_progress_callback(self, callback) -> None:
+        self.base_model.set_fit_progress_callback(callback)
+
+    def predict(
+        self,
+        frame: pd.DataFrame,
+        origins: pd.DatetimeIndex,
+        target_columns: Sequence[str],
+        horizons: Sequence[int],
+    ) -> pd.DataFrame:
+        output = self.base_model.predict(frame, origins, target_columns, horizons)
+        for target in target_columns:
+            for horizon_value in horizons:
+                horizon = int(horizon_value)
+                column = prediction_column(str(target), horizon, self.interval_minutes)
+                bins = self.calibrations.get(column)
+                if not bins:
+                    continue
+                target_times = origins + pd.Timedelta(
+                    minutes=horizon * self.interval_minutes
+                )
+                factors = np.asarray(
+                    [
+                        float(bins.get(str(int(hour) // self.hour_bin_size), 1.0))
+                        for hour in target_times.hour
+                    ],
+                    dtype=float,
+                )
+                output[column] = output[column].to_numpy(dtype=float) * factors
         return output

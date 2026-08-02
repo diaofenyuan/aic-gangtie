@@ -2,11 +2,12 @@
 extends: official_preliminary.yaml
 
 optuna:
-  n_trials: 8
+  n_trials: 4
   n_startup_trials: 4
   top_k: 2
   coarse_folds: 2
-  strategy: global
+  timeout_seconds: 600
+  strategy: mixed
   n_estimators_min: 150
   n_estimators_max: 450
   n_estimators_step: 150

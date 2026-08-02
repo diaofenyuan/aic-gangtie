@@ -199,3 +199,36 @@ class SeasonalNaiveModel(HistoricalBaseline):
             if pd.notna(value):
                 return float(value)
         return float(history.iloc[-1])
+
+
+class SeasonalMedianModel(HistoricalBaseline):
+    """多个历史同刻的中位数，对单日异常和偶发启停更不敏感。"""
+
+    def __init__(
+        self,
+        period_steps: int,
+        seasons: int = 3,
+        interval_minutes: int = 15,
+    ):
+        super().__init__(interval_minutes)
+        if period_steps <= 0:
+            raise ValueError("季节周期必须大于 0")
+        if seasons <= 0:
+            raise ValueError("季节样本数必须大于 0")
+        self.period_steps = int(period_steps)
+        self.seasons = int(seasons)
+
+    def _predict_value(self, history: pd.Series, origin: pd.Timestamp, horizon: int) -> float:
+        offset = pd.Timedelta(minutes=self.interval_minutes)
+        target_time = origin + int(horizon) * offset
+        values: list[float] = []
+        for season in range(1, self.seasons + 1):
+            historical_time = target_time - season * self.period_steps * offset
+            if historical_time > origin or historical_time not in history.index:
+                continue
+            value = history.loc[historical_time]
+            if isinstance(value, pd.Series):
+                value = value.iloc[-1]
+            if pd.notna(value):
+                values.append(float(value))
+        return float(np.median(values)) if values else float(history.iloc[-1])

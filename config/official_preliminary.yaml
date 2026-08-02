@@ -64,7 +64,7 @@ preprocessing:
     replace_with: median
 
 features:
-  lag_steps: [1, 2, 4, 8, 16, 32, 96, 672]
+  lag_steps: [1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 24, 32, 48, 96, 192, 288, 672]
   rolling_windows: [4, 8, 16, 32, 96]
 
 forecast:
@@ -103,23 +103,44 @@ recent_validation:
 
 # 正式高分档；快速调试请使用 official_preliminary_fast.yaml。
 optuna:
-  n_trials: 30
-  n_startup_trials: 10
-  top_k: 5
-  coarse_folds: 4
-  strategy: global
+  # 25 分钟搜索上限为后续完整复核、8 折评分和提交生成预留时间。
+  n_trials: 10
+  n_startup_trials: 6
+  top_k: 4
+  coarse_folds: 2
+  timeout_seconds: 1500
+  strategy: mixed
   n_estimators_min: 150
   n_estimators_max: 750
   n_estimators_step: 150
+  direct_n_estimators_max: 450
   catboost_iterations_min: 75
   catboost_iterations_max: 225
   catboost_iterations_step: 75
+  direct_catboost_iterations_max: 150
 
 model_selection:
-  recent_folds: 4
-  cross_month_folds: 4
-  minimum_non_degraded_folds: 5
-  maximum_worst_degradation: 0.01
+  recent_folds: 3
+  cross_month_folds: 3
+  # 激进冲榜：近期折更贴近官方两天评分期，允许少量跨月退化。
+  minimum_non_degraded_folds: 3
+  maximum_worst_degradation: 0.03
+  fold_group_weights:
+    recent_: 3.0
+    cross_month_: 1.0
+  baseline_candidates:
+    - {name: damped_trend, type: damped_trend, window: 5, damping: 0.85}
+    - {name: daily_naive, type: seasonal_naive, period_steps: 96}
+    - {name: daily_median_3, type: seasonal_median, period_steps: 96, seasons: 3}
+  hourly_calibration:
+    enabled: false
+    hour_bin_size: 4
+    minimum_samples: 24
+    shrinkage: 48
+    minimum_factor: 0.90
+    maximum_factor: 1.10
+    minimum_non_degraded_folds: 4
+    maximum_worst_degradation: 0.005
 
 submission:
   stage: preliminary

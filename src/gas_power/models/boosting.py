@@ -140,6 +140,32 @@ class BoostingMultiHorizonModel(ForecastModel):
         estimator.fit(x, y, sample_weight=sample_weight)
         return estimator, constant_response
 
+    def _add_target_time_features(
+        self,
+        features: pd.DataFrame,
+        horizon: int,
+    ) -> pd.DataFrame:
+        """加入预测目标时刻特征，使全局模型显式区分跨时段的多步任务。"""
+
+        values = features.copy()
+        target_index = pd.DatetimeIndex(features.index) + pd.Timedelta(
+            minutes=int(horizon) * self.interval_minutes
+        )
+        minute_of_day = target_index.hour * 60 + target_index.minute
+        day_angle = 2.0 * np.pi * minute_of_day / 1440.0
+        week_angle = 2.0 * np.pi * (
+            target_index.dayofweek * 1440 + minute_of_day
+        ) / (7.0 * 1440.0)
+        values["feat_horizon_steps"] = int(horizon)
+        values["feat_target_time_day_sin"] = np.sin(day_angle)
+        values["feat_target_time_day_cos"] = np.cos(day_angle)
+        values["feat_target_time_week_sin"] = np.sin(week_angle)
+        values["feat_target_time_week_cos"] = np.cos(week_angle)
+        values["feat_target_time_hour"] = target_index.hour.astype(np.int8)
+        values["feat_target_time_dayofweek"] = target_index.dayofweek.astype(np.int8)
+        values["feat_target_time_is_weekend"] = (target_index.dayofweek >= 5).astype(np.int8)
+        return values
+
     def fit(
         self,
         frame: pd.DataFrame,
@@ -222,8 +248,6 @@ class BoostingMultiHorizonModel(ForecastModel):
                     x, y, weight = self._training_slice(
                         frame, labels, features, str(target), horizon, end
                     )
-                    x = x.copy()
-                    x["feat_horizon_steps"] = horizon
                     x_parts.append(x)
                     y_parts.append(y)
                     weight_parts.append(weight)
@@ -271,7 +295,9 @@ class BoostingMultiHorizonModel(ForecastModel):
         valid = origin_mask & response.notna()
         if self.training_window_days is not None:
             valid &= features.index >= train_end - pd.Timedelta(days=self.training_window_days)
-        x = features.loc[valid, self.feature_columns_]
+        x = self._add_target_time_features(
+            features.loc[valid, self.feature_columns_], horizon
+        )
         y = pd.to_numeric(response.loc[valid], errors="coerce")
         finite_y = np.isfinite(y.to_numpy(dtype=float))
         x = x.loc[finite_y]
@@ -326,13 +352,13 @@ class BoostingMultiHorizonModel(ForecastModel):
                     estimator = self.models_.get((str(target), horizon))
                     if estimator is None:
                         raise ValueError(f"模型未训练目标 {target} 步长 {horizon}")
-                    prediction = np.asarray(estimator.predict(features), dtype=float)
+                    horizon_features = self._add_target_time_features(features, horizon)
+                    prediction = np.asarray(estimator.predict(horizon_features), dtype=float)
                 else:
                     estimator = self.models_.get(str(target))
                     if estimator is None:
                         raise ValueError(f"全局模型未训练目标 {target}")
-                    global_features = features.copy()
-                    global_features["feat_horizon_steps"] = horizon
+                    global_features = self._add_target_time_features(features, horizon)
                     prediction = np.asarray(estimator.predict(global_features), dtype=float)
                 if self.target_mode == "delta":
                     prediction = current + prediction
