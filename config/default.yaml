@@ -157,6 +157,12 @@ features:
   rolling_windows: [4, 8, 16, 96]
   rolling_statistics: [mean, std, min, max, slope, quantile]
   rolling_quantiles: true
+  holder_momentum_enabled: false
+  holder_momentum_steps: [1, 4, 8, 16]
+  gas_load_mismatch:
+    enabled: false
+    windows: [4, 8, 16]
+    minimum_load_mw: 1.0
   unit_online_threshold_mw: 1.0
   stable_delta_threshold_mw: 2.0
 
@@ -189,18 +195,6 @@ forecast:
       minimum_floor: 1.0e-6
       recency_half_life_days: 30
     training_window_days: 90
-  deep_learning:
-    context_steps: 192
-    context_candidates: [192, 384, 672]
-    epochs: 200
-    patience: 20
-    batch_size: 128
-    learning_rate: 0.001
-    hidden_size: 64
-    patch_size: 16
-    dropout: 0.1
-    seeds: [2026, 2027, 2028]
-    device: auto
   prediction_origins:
     mode: tail
     count: 4
@@ -305,16 +299,6 @@ postprocessing:
     generator_all: 440.0
   ramp_limit_mw_per_step: null
   enforce_target_consistency: true
-
-gpu:
-  enabled: false
-  device: cuda
-  batch_size: 64
-  seed: 2026
-  min_gain_all_folds: 0.001
-  require_cpu_baselines_complete: true
-  candidate_models: [TCN, PatchTST]
-  status: "CPU 基线和提升模型稳定性未完成前禁止启用"
 
 relations:
   max_delay_steps: 12

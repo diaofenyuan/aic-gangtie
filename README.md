@@ -21,7 +21,7 @@ uv pip install --python .venv/Scripts/python.exe -r requirements.txt   # Windows
 uv pip install --python .venv/bin/python -r requirements.txt           # Linux
 ```
 
-LightGBM、CatBoost、Optuna 和 PyTorch 是高精度流程的可选依赖，默认基线不要求安装：
+LightGBM、CatBoost 和 Optuna 是高精度流程的可选依赖，默认基线不要求安装：
 
 ```bash
 python -m pip install ".[lightgbm]"
@@ -29,7 +29,7 @@ python -m pip install ".[catboost]"
 python -m pip install ".[high-accuracy]"
 ```
 
-正式离线环境应提前下载对应 Python 3.10 wheel。若国内网络下载受限，可在联网准备环境中使用清华或阿里云镜像，然后把 wheel 和项目一起带入离线环境。`doctor` 会报告 LightGBM、CatBoost、Optuna、PyTorch 和 CUDA 是否可用。
+正式离线环境应提前下载对应 Python 3.10 wheel。若国内网络下载受限，可在联网准备环境中使用清华或阿里云镜像，然后把 wheel 和项目一起带入离线环境。`doctor` 会报告 LightGBM、CatBoost 和 Optuna 是否可用。
 
 ## 一键运行
 
@@ -115,7 +115,7 @@ python -m src.cli --config config/default.yaml benchmark
 │   ├── relations.py               # 确定性关系和固定时延发现
 │   ├── scoring.py                 # 可配置评分公式
 │   ├── postprocessing.py          # 物理约束后处理及前后对比
-│   ├── gpu_gate.py                # 残差模型与 GPU 实验门控
+│   ├── gpu_gate.py                # 残差模型的时间折稳定性门控
 │   ├── submission.py              # 提交文件联合校验与追踪清单
 │   ├── data.py                    # 多表读取、重采样、对齐和因果清洗
 │   ├── features.py                # 先 shift 后 rolling 的因果特征
@@ -171,7 +171,7 @@ python -m src.cli --config config/default.yaml benchmark
 - `target_mode: delta`：默认预测未来相对当前负荷的变化量；
 - `target_mode: absolute`：直接预测未来绝对负荷。
 
-`ForecastModel` 是统一接口。高精度配置下，LightGBM/CatBoost direct 残差模型、组件重建模型以及从零训练的 TCN/PatchTST 共用 `fit/predict` 契约；深度模型使用 RobustScaler、SmoothL1+MAPE 混合损失、多随机种子和早停，不使用外部预训练权重。
+`ForecastModel` 是统一接口。高精度配置下，LightGBM/CatBoost direct 残差模型和组件重建模型共用 `fit/predict` 契约。
 
 `residual_lightgbm` 与 `residual_catboost` 实现“基线预测 + 残差预测”。残差模型支持 direct/global 两种多步策略；最终 `train/predict` 前必须存在当前运行目录的 `outputs/<完成时间>预测结果/reports/residual_gate.json`，且全部时间折达到配置改善阈值。验证标签不能用于单样本融合权重。
 
@@ -238,10 +238,6 @@ python -m src.cli --config config/default.yaml benchmark
 
 提交压缩包按初赛要求固定打包 `input.csv` 和 `s_result.csv`，压缩包名称由 `submission.archive_name` 配置且不增加额外目录层级。
 
-## GPU 与深度模型
-
-高精度初赛配置默认搜索 TCN/PatchTST，但只有通过与树模型相同的原始标签稳定性门槛才会进入最终融合；无法使用 CUDA 时可切换 `forecast.deep_learning.device: cpu`，不会改变合规边界。优化模型始终使用 CPU HiGHS。
-
 ## 等待正式数据或规则确认
 
 以下内容不能从赛题 PDF 唯一确定，当前只在 `config/default.yaml` 以 `value + status` 形式提供合成流程占位值：
@@ -293,7 +289,7 @@ python -m pytest                                               45 passed
 ruff check src tests run.py                                    All checks passed
 ```
 
-端到端流程生成 2016 个合成时间点。所有合成分数只写入机器报告，不在 README 中解释为正式成绩。近零标签按官方未平滑 MAPE 单独告警；本轮基线和回测均未达到配置中的 99.5/99.9 可达性阈值。扩展/滚动回测均覆盖稳定、爬坡、启停和高缺失工况，官方两天回测覆盖月份切换和周末代理变量。残差门控因未在所有时间折稳定改善而拒绝，GPU 门控因配置关闭而拒绝。
+端到端流程生成 2016 个合成时间点。所有合成分数只写入机器报告，不在 README 中解释为正式成绩。近零标签按官方未平滑 MAPE 单独告警；本轮基线和回测均未达到配置中的 99.5/99.9 可达性阈值。扩展/滚动回测均覆盖稳定、爬坡、启停和高缺失工况，官方两天回测覆盖月份切换和周末代理变量。残差门控因未在所有时间折稳定改善而拒绝。
 
 - `s_result.csv`：4 行、17 列；
 - `l_result.csv`：4 行、193 列；

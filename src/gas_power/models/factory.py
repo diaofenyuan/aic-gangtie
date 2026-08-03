@@ -23,7 +23,6 @@ from gas_power.models.parameterization import (
     ComponentReconstructionModel,
     GasAvailabilityForecastModel,
 )
-from gas_power.models.deep import NeuralResidualMultiHorizonModel
 
 
 def baseline_from_spec(spec: Mapping[str, Any], interval_minutes: int) -> ForecastModel:
@@ -180,31 +179,4 @@ def build_model(config: ProjectConfig) -> ForecastModel:
                 interval_minutes=interval_minutes,
             )
         return base_model
-    if model_type in {"tcn", "patchtst"}:
-        deep = forecast.get("deep_learning", {})
-        if not isinstance(deep, Mapping):
-            raise ValueError("forecast.deep_learning 必须是字典")
-        roles = config.section("data")["roles"]
-        builder = CausalFeatureBuilder(
-            feature_config=config.section("features"),
-            roles=roles,
-            interval_minutes=interval_minutes,
-            availability=FeatureAvailabilityRegistry.from_config(config),
-            model_scope="long",
-        )
-        return NeuralResidualMultiHorizonModel(
-            architecture=model_type,
-            feature_builder=builder,
-            context_steps=int(deep.get("context_steps", 192)),
-            epochs=int(deep.get("epochs", 200)),
-            patience=int(deep.get("patience", 20)),
-            batch_size=int(deep.get("batch_size", 128)),
-            learning_rate=float(deep.get("learning_rate", 1.0e-3)),
-            hidden_size=int(deep.get("hidden_size", 64)),
-            patch_size=int(deep.get("patch_size", 16)),
-            dropout=float(deep.get("dropout", 0.1)),
-            seeds=[int(value) for value in deep.get("seeds", [2026, 2027, 2028])],
-            device=str(deep.get("device", "auto")),
-            interval_minutes=interval_minutes,
-        )
     raise ValueError(f"未知模型类型: {model_type}")

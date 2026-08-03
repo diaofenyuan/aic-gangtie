@@ -167,7 +167,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command", required=False)
     subparsers.add_parser("generate-synthetic", help="生成仅用于流程测试的合成数据")
-    subparsers.add_parser("doctor", help="检查 LightGBM、CatBoost、Optuna 和 PyTorch CUDA")
+    subparsers.add_parser("doctor", help="检查 LightGBM、CatBoost 和 Optuna")
     subparsers.add_parser("train", help="预处理、构建特征并训练模型")
     subparsers.add_parser("tune", help="运行 Optuna 粗筛、完整时间折复核和 OOF 融合")
     subparsers.add_parser("validate", help="执行时间滚动验证和泄漏检查")

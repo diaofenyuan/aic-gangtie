@@ -13,11 +13,11 @@ SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-# IDE 无参数直接运行使用略低于正式配置的搜索预算，便于复用已有调参结果。
-# 显式传入命令行参数或环境变量时仍按调用方指定的正式预算执行。
+# IDE 无参数运行复用已经完成的 9 个 Optuna 试验，并固定复核高分版三主力。
+# 训练数据增强候选未通过双留出消融，因此不占用正式运行的复核预算。
 if len(sys.argv) == 1:
-    os.environ.setdefault("GAS_POWER_TUNE_TRIALS", "10")
-    os.environ.setdefault("GAS_POWER_TUNE_TOP_K", "4")
+    os.environ.setdefault("GAS_POWER_TUNE_TRIALS", "9")
+    os.environ.setdefault("GAS_POWER_TUNE_TOP_K", "3")
 
 # 原生计算库通常在导入时读取线程配置，因此必须在导入项目入口前完成初始化。
 # 调用方可通过 GAS_POWER_WORKERS 指定并行度；未指定时最多使用 16 个逻辑处理器。

@@ -24,8 +24,7 @@ dependencies = [
 lightgbm = ["lightgbm>=4.0,<5"]
 catboost = ["catboost>=1.2,<2"]
 optuna = ["optuna>=3.6,<5"]
-torch = ["torch>=2.2,<3"]
-high-accuracy = ["lightgbm>=4.0,<5", "catboost>=1.2,<2", "optuna>=3.6,<5", "torch>=2.2,<3"]
+high-accuracy = ["lightgbm>=4.0,<5", "catboost>=1.2,<2", "optuna>=3.6,<5"]
 dev = ["pytest>=8.0,<9", "pytest-cov>=5.0,<7"]
 
 [project.scripts]

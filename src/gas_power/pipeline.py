@@ -36,18 +36,25 @@ from gas_power.features import (
     assert_shift_before_rolling,
 )
 from gas_power.environment import check_high_accuracy_environment
-from gas_power.gpu_gate import evaluate_gpu_gate, evaluate_residual_gate
+from gas_power.gpu_gate import evaluate_residual_gate
 from gas_power.models import build_model
 from gas_power.models.base import prediction_column, prediction_columns
 from gas_power.models.baselines import LastValueModel
 from gas_power.models.factory import baseline_from_spec
-from gas_power.models.ensemble import HourlyCalibratedModel, HorizonWeightedEnsembleModel
+from gas_power.models.ensemble import (
+    HourlyCalibratedModel,
+    HorizonWeightedEnsembleModel,
+)
+from gas_power.regimes import regime_labels_from_features
 from gas_power.ensemble_selection import (
     apply_oof_weights,
+    apply_regime_oof_weights,
     cross_fit_hourly_mape_calibration,
     evaluate_oof_column_gate,
+    fit_hard_oof_winner,
     fit_hourly_mape_calibration,
     fit_oof_weights,
+    fit_regime_oof_weights,
 )
 from gas_power.optimization import (
     DispatchInput,
@@ -73,7 +80,6 @@ from gas_power.validation import (
 )
 from gas_power.tuning import (
     candidate_config_from_descriptor,
-    run_deep_search,
     run_tree_search,
 )
 
@@ -151,8 +157,7 @@ def _assert_selection_fold_coverage(
         missing = sorted(expected.difference(actual))
         unexpected = sorted(actual.difference(expected))
         raise ValueError(
-            f"{context} 的模型选择折未完整对齐："
-            f"缺少 {missing}，多出 {unexpected}"
+            f"{context} 的模型选择折未完整对齐：缺少 {missing}，多出 {unexpected}"
         )
 
 
@@ -165,14 +170,7 @@ def _large_error_reports(
     denominator = np.maximum(np.abs(values["y_true"].to_numpy(dtype=float)), 1.0e-6)
     values["ape"] = np.abs(values["y_pred"] - values["y_true"]) / denominator
     values["origin_hour"] = pd.to_datetime(values["origin"]).dt.hour
-    values["regime"] = "stable"
-    for target in values["target"].astype(str).unique():
-        target_mask = values["target"].astype(str) == target
-        for suffix in ("ramp_up", "ramp_down", "startup", "shutdown"):
-            column = f"feat_state_{target}_{suffix}"
-            if column in values:
-                mask = target_mask & (values[column].fillna(0.0) > 0.5)
-                values.loc[mask, "regime"] = suffix
+    values["regime"] = regime_labels_from_features(values)
     missing_columns = [
         column for column in values if str(column).startswith("feat_missing__")
     ]
@@ -180,10 +178,14 @@ def _large_error_reports(
         column for column in values if str(column).startswith("feat_outlier__")
     ]
     values["has_missing"] = (
-        values[missing_columns].fillna(0.0).sum(axis=1) > 0 if missing_columns else False
+        values[missing_columns].fillna(0.0).sum(axis=1) > 0
+        if missing_columns
+        else False
     )
     values["has_outlier"] = (
-        values[outlier_columns].fillna(0.0).sum(axis=1) > 0 if outlier_columns else False
+        values[outlier_columns].fillna(0.0).sum(axis=1) > 0
+        if outlier_columns
+        else False
     )
     values["has_gas_gap"] = (
         values["feat_gas_total_supply_gap"].fillna(0.0) > 0.0
@@ -193,7 +195,9 @@ def _large_error_reports(
     thresholds = values.groupby(["target", "horizon_steps"])["ape"].transform(
         lambda series: series.quantile(0.95)
     )
-    largest = values.loc[values["ape"] >= thresholds].sort_values("ape", ascending=False)
+    largest = values.loc[values["ape"] >= thresholds].sort_values(
+        "ape", ascending=False
+    )
     group_columns = [
         "target",
         "horizon_steps",
@@ -203,11 +207,15 @@ def _large_error_reports(
         "has_outlier",
         "has_gas_gap",
     ]
-    groups = values.groupby(group_columns, dropna=False).agg(
-        samples=("ape", "size"),
-        mean_mape=("ape", "mean"),
-        p95_mape=("ape", lambda series: series.quantile(0.95)),
-    ).reset_index()
+    groups = (
+        values.groupby(group_columns, dropna=False)
+        .agg(
+            samples=("ape", "size"),
+            mean_mape=("ape", "mean"),
+            p95_mape=("ape", lambda series: series.quantile(0.95)),
+        )
+        .reset_index()
+    )
     groups = groups.sort_values(["mean_mape", "samples"], ascending=[False, False])
     return largest, groups
 
@@ -229,7 +237,9 @@ def _feature_builder(config: ProjectConfig) -> CausalFeatureBuilder:
     return CausalFeatureBuilder(
         feature_config=config.section("features"),
         roles=config.section("data")["roles"],
-        interval_minutes=int(config.section("optimization").get("interval_minutes", 15)),
+        interval_minutes=int(
+            config.section("optimization").get("interval_minutes", 15)
+        ),
         availability=FeatureAvailabilityRegistry.from_config(config),
         model_scope="long",
     )
@@ -258,12 +268,15 @@ def prepare_prepared_data(
         disable=not progress_enabled(config),
         mininterval=0.2,
     ) as data_progress:
+
         def advance(label: str) -> None:
             data_progress.set_postfix_str(f"完成: {label}", refresh=False)
             data_progress.update(1)
 
         data_progress.set_postfix_str("正在读取数据", refresh=True)
-        prepared, quality = loader.load_prepared(progress_callback=advance, source="training")
+        prepared, quality = loader.load_prepared(
+            progress_callback=advance, source="training"
+        )
         frame = prepared.model_input
         data_progress.set_postfix_str("正在构建特征", refresh=True)
         features = builder.transform(frame, progress_callback=advance)
@@ -295,17 +308,16 @@ def environment_pipeline(config: ProjectConfig) -> dict[str, Any]:
 
 def _is_preliminary(config: ProjectConfig) -> bool:
     compliance = config.raw.get("competition_compliance")
-    return (
-        isinstance(compliance, Mapping)
-        and compliance.get("stage") == "preliminary"
-    )
+    return isinstance(compliance, Mapping) and compliance.get("stage") == "preliminary"
 
 
 def _model_horizons(config: ProjectConfig) -> list[int]:
     """初赛模型只训练和验证短周期，避免无关的 96 步任务稀释目标。"""
 
     forecast = config.section("forecast")
-    steps = int(forecast["short_steps"] if _is_preliminary(config) else forecast["long_steps"])
+    steps = int(
+        forecast["short_steps"] if _is_preliminary(config) else forecast["long_steps"]
+    )
     return list(range(1, steps + 1))
 
 
@@ -319,15 +331,42 @@ def train_pipeline(config: ProjectConfig) -> dict[str, Any]:
     _assert_final_residual_gate(config)
     model = build_model(config)
     train_end = pd.Timestamp(frame.index.max())
-    model.fit(
-        frame,
-        targets,
-        horizons,
-        train_end=train_end,
-        raw_targets=prepared.raw_targets,
-        feature_matrix=features,
-        data_source=prepared.source,
+    fit_steps = model.fit_progress_steps(targets, horizons)
+    fit_progress = progress_bar(
+        total=fit_steps,
+        desc="最终模型训练",
+        unit="轮",
+        position=1,
+        leave=False,
+        disable=not progress_enabled(config),
     )
+    fit_completed = 0
+
+    def advance_fit(label: str) -> None:
+        nonlocal fit_completed
+        fit_completed += 1
+        fit_progress.update(1)
+        fit_progress.set_postfix_str(label, refresh=True)
+
+    model.set_fit_progress_callback(
+        advance_fit if progress_enabled(config) else None
+    )
+    try:
+        model.fit(
+            frame,
+            targets,
+            horizons,
+            train_end=train_end,
+            raw_targets=prepared.raw_targets,
+            feature_matrix=features,
+            data_source=prepared.source,
+        )
+    finally:
+        model.set_fit_progress_callback(None)
+        # 早停会使实际轮数小于理论上限，结束时按实际完成数收束进度条。
+        fit_progress.total = fit_completed
+        fit_progress.refresh()
+        fit_progress.close()
     model_path = config.path("models") / "forecast_model.joblib"
     joblib.dump(model, model_path, compress=3)
     metadata = {
@@ -345,7 +384,9 @@ def train_pipeline(config: ProjectConfig) -> dict[str, Any]:
         "raw_label_columns": targets,
         "training_data_source": prepared.source,
         "feature_source_whitelist": sorted(
-            FeatureAvailabilityRegistry.from_config(config).allowed_source_columns("long")
+            FeatureAvailabilityRegistry.from_config(config).allowed_source_columns(
+                "long"
+            )
         ),
     }
     _write_json(metadata, config.path("models") / "forecast_model_metadata.json")
@@ -364,30 +405,18 @@ def tune_pipeline(config: ProjectConfig) -> dict[str, Any]:
         prepared,
         _feature_builder(config),
         feature_matrix=features,
-        n_trials=int(os.environ.get("GAS_POWER_TUNE_TRIALS", settings.get("n_trials", 30))),
+        n_trials=int(
+            os.environ.get("GAS_POWER_TUNE_TRIALS", settings.get("n_trials", 30))
+        ),
         top_k=int(os.environ.get("GAS_POWER_TUNE_TOP_K", settings.get("top_k", 5))),
         coarse_folds=int(settings.get("coarse_folds", 4)),
         show_progress=progress_enabled(config),
     )
-    deep_settings = config.section("forecast").get("deep_learning", {})
-    deep_settings = deep_settings if isinstance(deep_settings, Mapping) else {}
-    deep_candidates = (
-        run_deep_search(
-            config,
-            prepared,
-            _feature_builder(config),
-            feature_matrix=features,
-            coarse_folds=int(deep_settings.get("coarse_folds", 4)),
-            top_k=int(deep_settings.get("search_top_k", 2)),
-            coarse_epochs=int(deep_settings.get("coarse_epochs", 60)),
-            show_progress=progress_enabled(config),
-        )
-        if bool(deep_settings.get("search_enabled", False))
-        else []
+    reviewed_candidates = sorted(
+        tree_candidates, key=lambda item: item.selection_metric
     )
-    candidates = sorted(
-        [*tree_candidates, *deep_candidates], key=lambda item: item.selection_metric
-    )
+    # 总体门槛失败的模型不得再凭单列偶然收益进入最终融合。
+    candidates = [candidate for candidate in reviewed_candidates if candidate.gate.passed]
     reports = config.path("reports", "reports")
     results = config.path("results")
     targets = [str(value) for value in config.section("data")["roles"]["targets"]]
@@ -456,17 +485,31 @@ def tune_pipeline(config: ProjectConfig) -> dict[str, Any]:
         str(column)
         for column in baseline_selection.columns
         if str(column).startswith(
-            ("feat_state_", "feat_missing__", "feat_outlier__", "feat_holder_", "feat_gas_")
+            (
+                "feat_state_",
+                "feat_missing__",
+                "feat_outlier__",
+                "feat_holder_",
+                "feat_gas_",
+            )
         )
     ]
     oof = baseline_selection[keys + ["y_true", "y_pred", *condition_columns]].rename(
         columns={"y_pred": "last_value"}
     )
+    oof["regime"] = regime_labels_from_features(oof)
     configured_baselines = selection.get("baseline_candidates", [])
     baseline_specs = (
         configured_baselines
         if isinstance(configured_baselines, list) and configured_baselines
-        else [{"name": "damped_trend", "type": "damped_trend", "window": 5, "damping": 0.85}]
+        else [
+            {
+                "name": "damped_trend",
+                "type": "damped_trend",
+                "window": 5,
+                "damping": 0.85,
+            }
+        ]
     )
     component_builders: dict[str, Any] = {}
     for baseline_index, raw_spec in enumerate(baseline_specs, start=1):
@@ -527,7 +570,12 @@ def tune_pipeline(config: ProjectConfig) -> dict[str, Any]:
         component_builders[name] = baseline_factory
     component_configs: dict[str, ProjectConfig] = {}
     for candidate_index, candidate in enumerate(candidates, start=1):
-        name = f"candidate_{candidate_index}_trial_{candidate.trial_number}"
+        candidate_label = candidate.name or f"trial_{candidate.trial_number}"
+        safe_label = "".join(
+            character if character.isalnum() or character == "_" else "_"
+            for character in candidate_label
+        )
+        name = f"candidate_{candidate_index}_{safe_label}"
         candidate_selection = _combine_selection_predictions(
             candidate.recent_predictions,
             candidate.cross_month_predictions,
@@ -549,14 +597,44 @@ def tune_pipeline(config: ProjectConfig) -> dict[str, Any]:
         component_configs[name] = candidate_config_from_descriptor(
             config, candidate.parameters
         )
-        component_builders[name] = lambda item=component_configs[name]: build_model(item)
+        component_builders[name] = lambda item=component_configs[name]: build_model(
+            item
+        )
 
     column_weights: dict[str, dict[str, float]] = {}
+    regime_column_weights: dict[str, dict[str, dict[str, float]]] = {}
+    hard_router_columns: dict[str, str] = {}
     loo_parts: list[pd.DataFrame] = []
+    regime_loo_parts: list[pd.DataFrame] = []
+    hard_router_loo_parts: list[pd.DataFrame] = []
     column_gate_rows: list[dict[str, Any]] = []
     fused = oof[keys + ["y_true"]].copy()
     fused["y_pred"] = np.nan
     fused_loo = fused.copy()
+    regime_settings = selection.get("regime_specialist", {})
+    regime_settings = regime_settings if isinstance(regime_settings, Mapping) else {}
+    regime_enabled = bool(regime_settings.get("enabled", False))
+    regime_minimum_samples = int(regime_settings.get("minimum_samples", 96))
+    regime_shrinkage = float(regime_settings.get("shrinkage", 192.0))
+    regime_gate_folds = int(
+        regime_settings.get("minimum_non_degraded_folds", minimum_non_degraded)
+    )
+    regime_worst = float(regime_settings.get("maximum_worst_degradation", 0.01))
+    regime_minimum_gain = float(regime_settings.get("minimum_mean_gain", 0.0))
+    hard_router_settings = selection.get("hard_router", {})
+    hard_router_settings = (
+        hard_router_settings if isinstance(hard_router_settings, Mapping) else {}
+    )
+    hard_router_enabled = bool(hard_router_settings.get("enabled", False))
+    hard_router_gate_folds = int(
+        hard_router_settings.get("minimum_non_degraded_folds", minimum_non_degraded)
+    )
+    hard_router_worst = float(
+        hard_router_settings.get("maximum_worst_degradation", 0.01)
+    )
+    hard_router_minimum_gain = float(
+        hard_router_settings.get("minimum_mean_gain", 0.0)
+    )
     for target in targets:
         for horizon in horizons:
             eligible = ["last_value"]
@@ -607,6 +685,108 @@ def tune_pipeline(config: ProjectConfig) -> dict[str, Any]:
                     held_out.weights,
                 )
 
+            prediction_name = prediction_column(target, horizon)
+            if regime_enabled and len(eligible) > 1:
+                fitted_regimes, regime_loo, regime_report = fit_regime_oof_weights(
+                    oof,
+                    eligible,
+                    target_column=target,
+                    horizon=horizon,
+                    fold_group_weights=fold_group_weights,
+                    minimum_samples=regime_minimum_samples,
+                    shrinkage=regime_shrinkage,
+                )
+                if not regime_report.empty:
+                    regime_report.insert(0, "target", target)
+                    regime_report.insert(1, "horizon_steps", horizon)
+                    regime_loo_parts.append(regime_report)
+                subset = oof.loc[mask]
+                regime_full = apply_regime_oof_weights(
+                    {name: subset[name].to_numpy(dtype=float) for name in eligible},
+                    subset["regime"].astype(str).to_numpy(),
+                    weights,
+                    fitted_regimes,
+                )
+                regime_frame = oof.assign(
+                    global_fused=fused_loo["y_pred"],
+                    regime_fused=fused_loo["y_pred"],
+                )
+                regime_frame.loc[regime_loo.index, "regime_fused"] = regime_loo
+                regime_gate = evaluate_oof_column_gate(
+                    regime_frame,
+                    target_column=target,
+                    horizon=horizon,
+                    candidate_column="regime_fused",
+                    baseline_column="global_fused",
+                    minimum_mean_gain=regime_minimum_gain,
+                    minimum_non_degraded_folds=regime_gate_folds,
+                    maximum_worst_degradation=regime_worst,
+                )
+                column_gate_rows.append(
+                    {
+                        "target": target,
+                        "horizon_steps": horizon,
+                        "candidate": "regime_specialist",
+                        "gate_type": "regime",
+                        **regime_gate.to_dict(),
+                    }
+                )
+                if regime_gate.passed and fitted_regimes:
+                    fused.loc[mask, "y_pred"] = regime_full
+                    fused_loo.loc[regime_loo.index, "y_pred"] = regime_loo
+                    regime_column_weights[prediction_name] = {
+                        regime: {
+                            name: float(weight)
+                            for name, weight in zip(eligible, regime_values)
+                            if float(weight) > 1.0e-10
+                        }
+                        for regime, regime_values in fitted_regimes.items()
+                    }
+
+            hard_winner: str | None = None
+            if hard_router_enabled and len(eligible) > 1:
+                winner, hard_router_loo, hard_router_report = fit_hard_oof_winner(
+                    oof,
+                    eligible,
+                    target_column=target,
+                    horizon=horizon,
+                    fold_group_weights=fold_group_weights,
+                )
+                hard_router_report.insert(0, "target", target)
+                hard_router_report.insert(1, "horizon_steps", horizon)
+                hard_router_loo_parts.append(hard_router_report)
+                hard_router_frame = oof.assign(
+                    routed_baseline=fused_loo["y_pred"],
+                    routed_candidate=fused_loo["y_pred"],
+                )
+                hard_router_frame.loc[
+                    hard_router_loo.index, "routed_candidate"
+                ] = hard_router_loo
+                hard_router_gate = evaluate_oof_column_gate(
+                    hard_router_frame,
+                    target_column=target,
+                    horizon=horizon,
+                    candidate_column="routed_candidate",
+                    baseline_column="routed_baseline",
+                    minimum_mean_gain=hard_router_minimum_gain,
+                    minimum_non_degraded_folds=hard_router_gate_folds,
+                    maximum_worst_degradation=hard_router_worst,
+                )
+                column_gate_rows.append(
+                    {
+                        "target": target,
+                        "horizon_steps": horizon,
+                        "candidate": f"hard_router:{winner}",
+                        "gate_type": "hard_router",
+                        **hard_router_gate.to_dict(),
+                    }
+                )
+                if hard_router_gate.passed:
+                    hard_winner = winner
+                    fused.loc[mask, "y_pred"] = oof.loc[mask, winner]
+                    fused_loo.loc[hard_router_loo.index, "y_pred"] = hard_router_loo
+                    regime_column_weights.pop(prediction_name, None)
+
             fusion_frame = oof.assign(fused_prediction=fused_loo["y_pred"])
             fusion_gate = evaluate_oof_column_gate(
                 fusion_frame,
@@ -625,15 +805,20 @@ def tune_pipeline(config: ProjectConfig) -> dict[str, Any]:
                     **fusion_gate.to_dict(),
                 }
             )
-            prediction_name = prediction_column(target, horizon)
             if fusion_gate.passed and len(eligible) > 1:
-                column_weights[prediction_name] = {
-                    name: float(weight)
-                    for name, weight in zip(eligible, weights)
-                    if float(weight) > 1.0e-10
-                }
+                if hard_winner is not None:
+                    column_weights[prediction_name] = {hard_winner: 1.0}
+                    hard_router_columns[prediction_name] = hard_winner
+                else:
+                    column_weights[prediction_name] = {
+                        name: float(weight)
+                        for name, weight in zip(eligible, weights)
+                        if float(weight) > 1.0e-10
+                    }
             else:
                 column_weights[prediction_name] = {"last_value": 1.0}
+                regime_column_weights.pop(prediction_name, None)
+                hard_router_columns.pop(prediction_name, None)
                 fused.loc[mask, "y_pred"] = oof.loc[mask, "last_value"]
                 fused_loo.loc[mask, "y_pred"] = oof.loc[mask, "last_value"]
 
@@ -694,10 +879,17 @@ def tune_pipeline(config: ProjectConfig) -> dict[str, Any]:
                 prediction_name = prediction_column(target, horizon)
                 if calibration_gate.passed and prediction_name in all_calibrations:
                     calibrated_loo.loc[mask, "y_pred"] = candidate_calibration.loc[mask]
-                    accepted_calibrations[prediction_name] = all_calibrations[prediction_name]
+                    accepted_calibrations[prediction_name] = all_calibrations[
+                        prediction_name
+                    ]
     accepted_columns = sum(
         any(name != "last_value" and weight > 0.0 for name, weight in weights.items())
-        for weights in column_weights.values()
+        or any(
+            name != "last_value" and weight > 0.0
+            for regime_weights in regime_column_weights.get(column, {}).values()
+            for name, weight in regime_weights.items()
+        )
+        for column, weights in column_weights.items()
     )
     used_model_names = {
         name
@@ -705,16 +897,32 @@ def tune_pipeline(config: ProjectConfig) -> dict[str, Any]:
         for name, weight in weights.items()
         if name != "last_value" and weight > 0.0
     }
+    used_model_names.update(
+        name
+        for regimes in regime_column_weights.values()
+        for weights in regimes.values()
+        for name, weight in weights.items()
+        if name != "last_value" and weight > 0.0
+    )
     components: dict[str, Any] = {"last_value": LastValueModel()}
     if accepted_columns:
         components.update(
-            {
-                name: component_builders[name]()
-                for name in sorted(used_model_names)
-            }
+            {name: component_builders[name]() for name in sorted(used_model_names)}
         )
-        final_model: Any = HorizonWeightedEnsembleModel(components, column_weights)
+        final_model: Any = HorizonWeightedEnsembleModel(
+            components,
+            column_weights,
+            regime_column_weights=regime_column_weights,
+            online_threshold_mw=float(regime_settings.get("online_threshold_mw", 1.0)),
+            stable_delta_threshold_mw=float(
+                regime_settings.get("stable_delta_threshold_mw", 2.0)
+            ),
+        )
         selected_status = "COLUMN_OOF_GATE_PASSED"
+        if regime_column_weights:
+            selected_status = f"{selected_status}_REGIME_GATED"
+        if hard_router_columns:
+            selected_status = f"{selected_status}_HARD_ROUTED"
     else:
         final_model = LastValueModel()
         selected_status = "FALLBACK_LAST_VALUE"
@@ -741,15 +949,23 @@ def tune_pipeline(config: ProjectConfig) -> dict[str, Any]:
     candidate_rows = [
         {
             "trial": item.trial_number,
+            "name": item.name,
+            "validation_role": item.validation_role,
             "recent_mape": item.recent_mape,
             "recent_worst_mape": item.recent_worst_mape,
             "cross_month_mape": item.cross_month_mape,
             "selection_metric": item.selection_metric,
-            **{f"gate_{key}": value for key, value in item.gate.to_dict().items() if key != "reasons"},
+            **{
+                f"gate_{key}": value
+                for key, value in item.gate.to_dict().items()
+                if key != "reasons"
+            },
             "gate_reasons": " | ".join(item.gate.reasons),
-            "parameters": json.dumps(item.parameters, ensure_ascii=False, sort_keys=True),
+            "parameters": json.dumps(
+                item.parameters, ensure_ascii=False, sort_keys=True
+            ),
         }
-        for item in candidates
+        for item in reviewed_candidates
     ]
     pd.DataFrame(candidate_rows).to_csv(
         reports / "high_accuracy_candidates.csv", index=False, encoding="utf-8"
@@ -770,6 +986,18 @@ def tune_pipeline(config: ProjectConfig) -> dict[str, Any]:
     if loo_parts:
         pd.concat(loo_parts, ignore_index=True).to_csv(
             reports / "high_accuracy_leave_one_fold.csv", index=False, encoding="utf-8"
+        )
+    if regime_loo_parts:
+        pd.concat(regime_loo_parts, ignore_index=True).to_csv(
+            reports / "high_accuracy_regime_leave_one_fold.csv",
+            index=False,
+            encoding="utf-8",
+        )
+    if hard_router_loo_parts:
+        pd.concat(hard_router_loo_parts, ignore_index=True).to_csv(
+            reports / "high_accuracy_hard_router_leave_one_fold.csv",
+            index=False,
+            encoding="utf-8",
         )
     column_gate_frame = pd.DataFrame(column_gate_rows)
     column_gate_frame.to_csv(
@@ -795,6 +1023,11 @@ def tune_pipeline(config: ProjectConfig) -> dict[str, Any]:
         "maximum_worst_degradation": maximum_worst_degradation,
         "fold_group_weights": fold_group_weights,
         "hourly_calibrated_columns": len(accepted_calibrations),
+        "regime_specialist_columns": len(regime_column_weights),
+        "hard_routed_columns": len(hard_router_columns),
+        "reviewed_candidates": len(reviewed_candidates),
+        "admitted_candidates": len(candidates),
+        "rejected_candidates": len(reviewed_candidates) - len(candidates),
     }
     model_hash = hashlib.sha256(model_path.read_bytes()).hexdigest()
     metadata = {
@@ -811,6 +1044,11 @@ def tune_pipeline(config: ProjectConfig) -> dict[str, Any]:
         "fusion_gate": fusion_summary,
         "column_gates": column_gate_rows,
         "weights": column_weights,
+        "regime_weights": regime_column_weights,
+        "hard_router": {
+            "enabled": hard_router_enabled,
+            "columns": hard_router_columns,
+        },
         "hourly_calibration": accepted_calibrations,
         "model_sha256": model_hash,
         "optuna_best_value": float(study.best_value),
@@ -877,7 +1115,9 @@ def predict_pipeline(config: ProjectConfig) -> dict[str, Any]:
     if origin_mode == "scoring":
         scoring_raw = _load_scoring_prepared(config)
         history_points = int(
-            config.raw.get("competition_compliance", {}).get("scoring_history_points", 672)
+            config.raw.get("competition_compliance", {}).get(
+                "scoring_history_points", 672
+            )
             if isinstance(config.raw.get("competition_compliance", {}), Mapping)
             else 672
         )
@@ -889,7 +1129,10 @@ def predict_pipeline(config: ProjectConfig) -> dict[str, Any]:
         )
         scoring_start = pd.Timestamp(scoring_prepared.model_input.index.min())
         frame = pd.concat(
-            [train_frame.loc[train_frame.index < scoring_start], scoring_prepared.model_input],
+            [
+                train_frame.loc[train_frame.index < scoring_start],
+                scoring_prepared.model_input,
+            ],
             axis=0,
         ).sort_index()
         if not frame.index.is_unique:
@@ -897,7 +1140,9 @@ def predict_pipeline(config: ProjectConfig) -> dict[str, Any]:
         origins = _prediction_origins(config, scoring_prepared.model_input)
         features = _feature_builder(config).transform(frame)
         settings = config.raw.get("prediction_input", {})
-        table_paths = settings.get("table_paths", {}) if isinstance(settings, Mapping) else {}
+        table_paths = (
+            settings.get("table_paths", {}) if isinstance(settings, Mapping) else {}
+        )
         if not isinstance(table_paths, Mapping) or not table_paths:
             raise ValueError("scoring 模式必须配置 prediction_input.table_paths")
         original_input = load_original_input_frame(
@@ -975,14 +1220,18 @@ def predict_pipeline(config: ProjectConfig) -> dict[str, Any]:
         interval_minutes,
         expected_origins=origins,
         capacity_bounds=dict(capacities) if isinstance(capacities, dict) else None,
-        enforce_target_consistency=bool(post_config.get("enforce_target_consistency", True)),
+        enforce_target_consistency=bool(
+            post_config.get("enforce_target_consistency", True)
+        ),
         capacity_tolerance=tolerance,
     )
 
     long_output: pd.DataFrame | None = None
     if not _is_preliminary(config):
         long_horizons = list(range(1, int(forecast_config["long_steps"]) + 1))
-        write_time_frame(raw_prediction, results_dir / "raw_l_result.csv", timestamp_format)
+        write_time_frame(
+            raw_prediction, results_dir / "raw_l_result.csv", timestamp_format
+        )
         long_output = write_forecast_csv(
             prediction,
             results_dir / "l_result.csv",
@@ -992,7 +1241,9 @@ def predict_pipeline(config: ProjectConfig) -> dict[str, Any]:
             interval_minutes,
             expected_origins=origins,
             capacity_bounds=dict(capacities) if isinstance(capacities, dict) else None,
-            enforce_target_consistency=bool(post_config.get("enforce_target_consistency", True)),
+            enforce_target_consistency=bool(
+                post_config.get("enforce_target_consistency", True)
+            ),
             capacity_tolerance=tolerance,
         )
 
@@ -1001,7 +1252,9 @@ def predict_pipeline(config: ProjectConfig) -> dict[str, Any]:
         features.loc[origins],
     )
     invalid_feature_names = [
-        str(column) for column in feature_output.columns if not str(column).startswith("feat_")
+        str(column)
+        for column in feature_output.columns
+        if not str(column).startswith("feat_")
     ]
     if invalid_feature_names:
         raise ValueError(f"派生输入字段必须以 feat_ 开头: {invalid_feature_names[:5]}")
@@ -1009,7 +1262,9 @@ def predict_pipeline(config: ProjectConfig) -> dict[str, Any]:
     if input_frame.columns.duplicated().any():
         raise ValueError("input.csv 构建后存在重复字段")
     quality_settings = submission_config.get("quality_normalization", {})
-    if isinstance(quality_settings, Mapping) and bool(quality_settings.get("enabled", False)):
+    if isinstance(quality_settings, Mapping) and bool(
+        quality_settings.get("enabled", False)
+    ):
         input_frame, matrix_quality = normalize_submission_input_frame(
             input_frame,
             quality_settings,
@@ -1091,10 +1346,14 @@ def predict_pipeline(config: ProjectConfig) -> dict[str, Any]:
         "seconds_per_sample": seconds_per_sample,
         "max_seconds_per_sample": max_per_sample,
         "max_total_inference_seconds": max_total,
-        "within_limits": seconds_per_sample <= max_per_sample and elapsed_seconds <= max_total,
+        "within_limits": seconds_per_sample <= max_per_sample
+        and elapsed_seconds <= max_total,
     }
     _write_json(runtime_report, results_dir / "reports" / "inference_runtime.json")
-    if bool(performance.get("enforce_limits", True)) and not runtime_report["within_limits"]:
+    if (
+        bool(performance.get("enforce_limits", True))
+        and not runtime_report["within_limits"]
+    ):
         raise RuntimeError(
             "预测推理超过 PDF 建议时限："
             f"单样本 {seconds_per_sample:.3f}s/{max_per_sample:.3f}s，"
@@ -1195,7 +1454,9 @@ def validate_pipeline(config: ProjectConfig) -> dict[str, Any]:
     cutoff = pd.Timestamp(frame.index[len(frame) // 2])
     assert_feature_causality(builder, frame, cutoff)
     targets = [str(value) for value in config.section("data")["roles"]["targets"]]
-    rolling_windows = [int(value) for value in config.section("features")["rolling_windows"]]
+    rolling_windows = [
+        int(value) for value in config.section("features")["rolling_windows"]
+    ]
     assert_shift_before_rolling(builder, frame, targets[0], rolling_windows[0])
 
     horizons = _model_horizons(config)
@@ -1238,7 +1499,9 @@ def validate_pipeline(config: ProjectConfig) -> dict[str, Any]:
             target_columns=targets,
             horizons=horizons,
             interval_minutes=interval_minutes,
-            near_zero_threshold=float(validation_config.get("near_zero_threshold", 1.0e-6)),
+            near_zero_threshold=float(
+                validation_config.get("near_zero_threshold", 1.0e-6)
+            ),
             worst_error_count=int(validation_config.get("worst_error_count", 50)),
             feature_builder=builder,
             raw_targets=prepared.raw_targets,
@@ -1262,7 +1525,9 @@ def validate_pipeline(config: ProjectConfig) -> dict[str, Any]:
             results_dir / "recent_validation_metrics.csv", index=False, encoding="utf-8"
         )
         recent_artifacts.predictions.to_csv(
-            results_dir / "recent_validation_predictions.csv", index=False, encoding="utf-8"
+            results_dir / "recent_validation_predictions.csv",
+            index=False,
+            encoding="utf-8",
         )
 
     # 本地评分仅使用训练期滚动验证的原始标签，不能替代赛事平台的正式评分。
@@ -1338,7 +1603,9 @@ def validate_pipeline(config: ProjectConfig) -> dict[str, Any]:
         "leakage_checks": "passed",
         "validation_protocol": {
             "cross_month_folds": len(artifacts.splits),
-            "recent_folds": len(recent_artifacts.splits) if recent_artifacts is not None else 0,
+            "recent_folds": len(recent_artifacts.splits)
+            if recent_artifacts is not None
+            else 0,
             "raw_labels": True,
             "scoring_used": False,
             "local_score_decision_source": decision_source,
@@ -1403,7 +1670,9 @@ def benchmark_pipeline(config: ProjectConfig) -> dict[str, Any]:
         show_progress=progress_enabled(config),
     )
     reports = config.path("reports", "reports")
-    artifacts.metrics.to_csv(reports / "benchmark_metrics.csv", index=False, encoding="utf-8")
+    artifacts.metrics.to_csv(
+        reports / "benchmark_metrics.csv", index=False, encoding="utf-8"
+    )
     artifacts.best.to_csv(reports / "benchmark_best.csv", index=False, encoding="utf-8")
     artifacts.predictions.to_csv(
         reports / "benchmark_predictions.csv", index=False, encoding="utf-8"
@@ -1425,12 +1694,14 @@ def benchmark_pipeline(config: ProjectConfig) -> dict[str, Any]:
         int(config.section("audit").get("lag_max_steps", 96)),
         interval,
     )
-    high_threshold = float(config.section("audit").get("high_correlation_threshold", 0.995))
-    high_future = future_lag.loc[
-        future_lag["absolute_correlation"] >= high_threshold
-    ]
+    high_threshold = float(
+        config.section("audit").get("high_correlation_threshold", 0.995)
+    )
+    high_future = future_lag.loc[future_lag["absolute_correlation"] >= high_threshold]
     artifacts.reachability["future_diagnostic_max_absolute_correlation"] = (
-        float(future_lag["absolute_correlation"].max()) if not future_lag.empty else None
+        float(future_lag["absolute_correlation"].max())
+        if not future_lag.empty
+        else None
     )
     artifacts.reachability["future_diagnostic_fields"] = sorted(
         high_future["feature"].astype(str).unique().tolist()
@@ -1475,9 +1746,17 @@ def discover_relations_pipeline(config: ProjectConfig) -> dict[str, Any]:
     artifacts.coefficients.to_csv(
         reports / "relation_coefficients.csv", index=False, encoding="utf-8"
     )
-    artifacts.setpoints.to_csv(reports / "setpoint_analysis.csv", index=False, encoding="utf-8")
-    artifacts.delays.to_csv(reports / "delay_relations.csv", index=False, encoding="utf-8")
-    return {**artifacts.summary, "reports": str(reports), "warning": _data_notice(config)}
+    artifacts.setpoints.to_csv(
+        reports / "setpoint_analysis.csv", index=False, encoding="utf-8"
+    )
+    artifacts.delays.to_csv(
+        reports / "delay_relations.csv", index=False, encoding="utf-8"
+    )
+    return {
+        **artifacts.summary,
+        "reports": str(reports),
+        "warning": _data_notice(config),
+    }
 
 
 def _postprocess_validation_tidy(
@@ -1492,7 +1771,9 @@ def _postprocess_validation_tidy(
     wide_parts = []
     for (_, origin), group in tidy.groupby(index_columns, sort=False):
         values = {
-            prediction_column(str(row.target), int(row.horizon_steps), interval): float(row.y_pred)
+            prediction_column(str(row.target), int(row.horizon_steps), interval): float(
+                row.y_pred
+            )
             for row in group.itertuples()
         }
         wide_parts.append(pd.Series(values, name=pd.Timestamp(origin)))
@@ -1524,8 +1805,13 @@ def backtest_pipeline(config: ProjectConfig) -> dict[str, Any]:
     near_zero = float(config.section("validation").get("near_zero_threshold", 1.0e-6))
     builder = _feature_builder(config)
     report_frames: dict[str, list[pd.DataFrame]] = {
-        "predictions": [], "fold": [], "aggregate": [], "condition": [],
-        "horizon": [], "gain": [], "post": [],
+        "predictions": [],
+        "fold": [],
+        "aggregate": [],
+        "condition": [],
+        "horizon": [],
+        "gain": [],
+        "post": [],
     }
     coverage: dict[str, Any] = {}
     post_adjustments: dict[str, Any] = {}
@@ -1541,14 +1827,28 @@ def backtest_pipeline(config: ProjectConfig) -> dict[str, Any]:
     ):
         splitter = splitter_from_config(split_config)
         model_artifacts = run_rolling_validation(
-            frame, lambda: build_model(config), splitter, targets, horizons, interval,
-            near_zero, int(config.section("validation").get("worst_error_count", 50)), builder,
+            frame,
+            lambda: build_model(config),
+            splitter,
+            targets,
+            horizons,
+            interval,
+            near_zero,
+            int(config.section("validation").get("worst_error_count", 50)),
+            builder,
             show_progress=progress_enabled(config),
             progress_description=f"{split_name} 模型",
         )
         baseline_artifacts = run_rolling_validation(
-            frame, lambda: LastValueModel(interval), splitter, targets, horizons, interval,
-            near_zero, 0, builder,
+            frame,
+            lambda: LastValueModel(interval),
+            splitter,
+            targets,
+            horizons,
+            interval,
+            near_zero,
+            0,
+            builder,
             show_progress=progress_enabled(config),
             progress_description=f"{split_name} 基线",
         )
@@ -1559,7 +1859,11 @@ def backtest_pipeline(config: ProjectConfig) -> dict[str, Any]:
         post_metrics = compare_postprocessing_metrics(
             model_artifacts.predictions, processed, near_zero
         )
-        primary = processed if bool(config.raw.get("postprocessing", {}).get("enabled", True)) else model_artifacts.predictions
+        primary = (
+            processed
+            if bool(config.raw.get("postprocessing", {}).get("enabled", True))
+            else model_artifacts.predictions
+        )
         details = summarize_detailed_validation(
             primary, baseline_artifacts.predictions, near_zero
         )
@@ -1584,9 +1888,12 @@ def backtest_pipeline(config: ProjectConfig) -> dict[str, Any]:
             .tolist()
         )
         for key, data_frame in (
-            ("predictions", primary), ("fold", details.fold_metrics),
-            ("aggregate", details.aggregate_metrics), ("condition", details.condition_metrics),
-            ("horizon", details.horizon_curve), ("gain", details.baseline_gain),
+            ("predictions", primary),
+            ("fold", details.fold_metrics),
+            ("aggregate", details.aggregate_metrics),
+            ("condition", details.condition_metrics),
+            ("horizon", details.horizon_curve),
+            ("gain", details.baseline_gain),
             ("post", post_metrics),
         ):
             data_frame = data_frame.copy()
@@ -1613,21 +1920,18 @@ def backtest_pipeline(config: ProjectConfig) -> dict[str, Any]:
         {"coverage": coverage, "postprocessing": post_adjustments},
         reports / "backtest_summary.json",
     )
-    residual_gate = evaluate_residual_gate(config.raw.get("residual_model", {}), fold_gains)
+    residual_gate = evaluate_residual_gate(
+        config.raw.get("residual_model", {}), fold_gains
+    )
     residual_gate["evaluated_model_type"] = str(
         config.section("forecast").get("model", {}).get("type", "")
     )
     _write_json(residual_gate, reports / "residual_gate.json")
-    gpu_gate = evaluate_gpu_gate(
-        config.raw.get("gpu", {}), cpu_baselines_complete=True, fold_gains=fold_gains
-    )
-    _write_json(gpu_gate.to_dict(), reports / "gpu_gate.json")
     return {
         "validation_types": list(config.section("backtest")),
         "rows": counts,
         "coverage": coverage,
         "residual_gate": residual_gate,
-        "gpu_gate": gpu_gate.to_dict(),
         "warning": _data_notice(config),
     }
 
@@ -1639,13 +1943,18 @@ def _assert_final_residual_gate(config: ProjectConfig) -> None:
         return
     residual = config.raw.get("residual_model", {})
     if not bool(residual.get("enabled", False)):
-        raise ValueError("残差模型仅处于实验状态；请先完成 backtest 并显式启用 residual_model.enabled")
+        raise ValueError(
+            "残差模型仅处于实验状态；请先完成 backtest 并显式启用 residual_model.enabled"
+        )
     gate_path = config.path("reports", "reports") / "residual_gate.json"
     if not gate_path.exists():
         raise ValueError("缺少 residual_gate.json；残差模型必须先完成全部时间折回测")
     with gate_path.open("r", encoding="utf-8") as stream:
         gate = json.load(stream)
-    if not bool(gate.get("allowed", False)) or gate.get("evaluated_model_type") != model_type:
+    if (
+        not bool(gate.get("allowed", False))
+        or gate.get("evaluated_model_type") != model_type
+    ):
         raise ValueError("残差模型未通过当前模型类型的全部时间折稳定改善门控")
 
 
@@ -1673,7 +1982,9 @@ def _configured_columns(value: Any) -> list[str]:
     if isinstance(value, list):
         return [column for item in value for column in _configured_columns(item)]
     if isinstance(value, Mapping):
-        return [column for item in value.values() for column in _configured_columns(item)]
+        return [
+            column for item in value.values() for column in _configured_columns(item)
+        ]
     return []
 
 
@@ -1740,7 +2051,9 @@ def _forecast_resource_boundaries(
 ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], np.ndarray, pd.DataFrame]:
     history, target_names = _resource_boundary_history(config, frame)
     optimization = config.section("optimization")
-    model_spec = optimization.get("resource_forecast", {"type": "seasonal_naive", "period_steps": 96})
+    model_spec = optimization.get(
+        "resource_forecast", {"type": "seasonal_naive", "period_steps": 96}
+    )
     if not isinstance(model_spec, Mapping):
         raise ValueError("optimization.resource_forecast 必须是字典")
     model = baseline_from_spec(model_spec, interval_minutes)
@@ -1766,11 +2079,22 @@ def _forecast_resource_boundaries(
     report.index.name = "datetime"
     for gas_type, (production_name, demand_name) in target_names.items():
         production_values = np.asarray(
-            [predictions.at[origin, prediction_column(production_name, horizon, interval_minutes)] for horizon in horizons],
+            [
+                predictions.at[
+                    origin,
+                    prediction_column(production_name, horizon, interval_minutes),
+                ]
+                for horizon in horizons
+            ],
             dtype=float,
         )
         demand_values = np.asarray(
-            [predictions.at[origin, prediction_column(demand_name, horizon, interval_minutes)] for horizon in horizons],
+            [
+                predictions.at[
+                    origin, prediction_column(demand_name, horizon, interval_minutes)
+                ]
+                for horizon in horizons
+            ],
             dtype=float,
         )
         production[gas_type] = np.clip(production_values, 0.0, None)
@@ -1785,7 +2109,9 @@ def _forecast_resource_boundaries(
             [
                 predictions.at[
                     origin,
-                    prediction_column("resource_baseline_generation", horizon, interval_minutes),
+                    prediction_column(
+                        "resource_baseline_generation", horizon, interval_minutes
+                    ),
                 ]
                 for horizon in horizons
             ],
@@ -1812,20 +2138,27 @@ def _dispatch_input(
         periods=periods,
         freq=f"{interval_minutes}min",
     )
-    production, demand, baseline_generation, resource_report = _forecast_resource_boundaries(
-        config, frame, origin, periods, interval_minutes
+    production, demand, baseline_generation, resource_report = (
+        _forecast_resource_boundaries(config, frame, origin, periods, interval_minutes)
     )
     initial_storage: dict[str, float] = {}
     for gas_type in optimization["gas_types"]:
         holder_column = str(roles["gas_holder"][gas_type])
-        storage_series = pd.to_numeric(frame[holder_column], errors="coerce").loc[:origin].dropna()
+        storage_series = (
+            pd.to_numeric(frame[holder_column], errors="coerce").loc[:origin].dropna()
+        )
         initial_storage[gas_type] = float(storage_series.iloc[-1])
 
     if "electricity_price" in frame:
         price_model = baseline_from_spec(
             {"type": "seasonal_naive", "period_steps": 96}, interval_minutes
         )
-        price_model.fit(frame.loc[:origin], ["electricity_price"], list(range(1, periods + 1)), origin)
+        price_model.fit(
+            frame.loc[:origin],
+            ["electricity_price"],
+            list(range(1, periods + 1)),
+            origin,
+        )
         price_prediction = price_model.predict(
             frame,
             pd.DatetimeIndex([origin]),
@@ -1835,7 +2168,8 @@ def _dispatch_input(
         price = np.asarray(
             [
                 price_prediction.at[
-                    origin, prediction_column("electricity_price", horizon, interval_minutes)
+                    origin,
+                    prediction_column("electricity_price", horizon, interval_minutes),
                 ]
                 for horizon in range(1, periods + 1)
             ],
@@ -1843,7 +2177,9 @@ def _dispatch_input(
         )
     else:
         fallback = optimization["fallback_price"]
-        valley = configured_value(fallback["valley"], "optimization.fallback_price.valley")
+        valley = configured_value(
+            fallback["valley"], "optimization.fallback_price.valley"
+        )
         flat = configured_value(fallback["flat"], "optimization.fallback_price.flat")
         peak = configured_value(fallback["peak"], "optimization.fallback_price.peak")
         hours = timestamps.hour
@@ -1938,15 +2274,22 @@ def demo_pipeline(config: ProjectConfig) -> dict[str, Any]:
     return results
 
 
-def run_task_pipeline(config: ProjectConfig) -> dict[str, Any]:
-    """执行当前赛段允许的训练、验证、预测及可选优化阶段。"""
+def _run_task_stages(config: ProjectConfig) -> list[tuple[str, Any]]:
+    """根据赛段和实验模式返回完整任务阶段。"""
 
     compliance = config.raw.get("competition_compliance", {})
     preliminary = (
-        isinstance(compliance, Mapping)
-        and compliance.get("stage") == "preliminary"
+        isinstance(compliance, Mapping) and compliance.get("stage") == "preliminary"
     )
-    if preliminary:
+    execution_mode = (
+        str(compliance.get("execution_mode", "selected_pipeline"))
+        if isinstance(compliance, Mapping)
+        else "selected_pipeline"
+    )
+    if preliminary and execution_mode == "direct_challenger":
+        # 高风险线上挑战器跳过树搜索和本地晋级门控，结果必须由线上分数裁决。
+        stages = [("train", train_pipeline), ("predict", predict_pipeline)]
+    elif preliminary:
         # 初赛默认入口必须先完成训练期搜索和原始标签门控，不能直接提交未选择的基线。
         stages = [
             ("tune", tune_pipeline),
@@ -1961,6 +2304,13 @@ def run_task_pipeline(config: ProjectConfig) -> dict[str, Any]:
         ]
     if not preliminary:
         stages.append(("optimize", optimize_pipeline))
+    return stages
+
+
+def run_task_pipeline(config: ProjectConfig) -> dict[str, Any]:
+    """执行当前赛段允许的训练、验证、预测及可选优化阶段。"""
+
+    stages = _run_task_stages(config)
     results: dict[str, Any] = {}
     stage_iterator = track_progress(
         stages,

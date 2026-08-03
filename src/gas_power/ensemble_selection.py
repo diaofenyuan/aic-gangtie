@@ -92,14 +92,30 @@ def _nnls_weights(
         scaled_actual = scaled_actual * scale
         scaled_predictions = scaled_predictions * scale[:, None]
     try:
-        from scipy.optimize import nnls
+        from scipy.optimize import minimize
 
-        weights, _ = nnls(scaled_predictions, scaled_actual)
-    except ImportError:
-        weights = np.maximum(
-            np.linalg.lstsq(scaled_predictions, scaled_actual, rcond=None)[0],
-            0.0,
+        initial = np.full(predictions.shape[1], 1.0 / predictions.shape[1])
+
+        def objective(weights: np.ndarray) -> float:
+            residual = scaled_predictions @ weights - scaled_actual
+            return float(residual @ residual)
+
+        def gradient(weights: np.ndarray) -> np.ndarray:
+            residual = scaled_predictions @ weights - scaled_actual
+            return 2.0 * scaled_predictions.T @ residual
+
+        result = minimize(
+            objective,
+            initial,
+            jac=gradient,
+            method="SLSQP",
+            bounds=[(0.0, 1.0)] * predictions.shape[1],
+            constraints={"type": "eq", "fun": lambda weights: weights.sum() - 1.0},
+            options={"maxiter": 300, "ftol": 1.0e-12},
         )
+        weights = np.asarray(result.x, dtype=float) if result.success else initial
+    except ImportError:
+        weights = np.full(predictions.shape[1], 1.0 / predictions.shape[1])
     if not np.isfinite(weights).all() or float(weights.sum()) <= 0.0:
         weights = np.ones(predictions.shape[1], dtype=float)
     return weights / float(weights.sum())
@@ -152,15 +168,297 @@ def fit_oof_weights(
             row_weights(train),
         )
         pred = held_out[list(model_names)].to_numpy(dtype=float) @ loo
-        denominator = np.maximum(np.abs(held_out["y_true"].to_numpy(dtype=float)), 1.0e-6)
+        denominator = np.maximum(
+            np.abs(held_out["y_true"].to_numpy(dtype=float)), 1.0e-6
+        )
         loo_rows.append(
             {
                 "fold": fold,
-                "mape": float(np.mean(np.abs(pred - held_out["y_true"].to_numpy(dtype=float)) / denominator)),
+                "mape": float(
+                    np.mean(
+                        np.abs(pred - held_out["y_true"].to_numpy(dtype=float))
+                        / denominator
+                    )
+                ),
                 "weights": loo.tolist(),
             }
         )
     return weights, pd.DataFrame(loo_rows)
+
+
+def _fold_row_weights(
+    values: pd.DataFrame,
+    fold_column: str,
+    fold_group_weights: Mapping[str, float] | None,
+) -> np.ndarray:
+    weights = np.ones(len(values), dtype=float)
+    for prefix, weight in (fold_group_weights or {}).items():
+        weights[
+            values[fold_column].astype(str).str.startswith(str(prefix)).to_numpy()
+        ] = float(weight)
+    return weights
+
+
+def fit_hard_oof_winner(
+    oof: pd.DataFrame,
+    model_names: Sequence[str],
+    *,
+    target_column: str,
+    horizon: int,
+    fold_column: str = "fold",
+    fold_group_weights: Mapping[str, float] | None = None,
+) -> tuple[str, pd.Series, pd.DataFrame]:
+    """选择单一 OOF 冠军，并返回不使用持出折标签的交叉预测。"""
+
+    names = list(model_names)
+    if not names or len(names) != len(set(names)):
+        raise ValueError("硬路由候选模型必须非空且名称不能重复")
+    required = {fold_column, "target", "horizon_steps", "y_true", *names}
+    missing = required.difference(oof.columns)
+    if missing:
+        raise ValueError(f"硬路由 OOF 数据缺少字段: {sorted(missing)}")
+
+    subset = oof.loc[
+        (oof["target"].astype(str) == str(target_column))
+        & (oof["horizon_steps"].astype(int) == int(horizon))
+    ].copy()
+    if subset.empty:
+        raise ValueError(f"硬路由 OOF 缺少 {target_column} t+{horizon} 的样本")
+    if not np.isfinite(subset[names].to_numpy(dtype=float)).all():
+        raise ValueError("硬路由候选预测包含缺失值或无穷值")
+
+    labeled = subset.loc[np.isfinite(subset["y_true"].to_numpy(dtype=float))]
+    if labeled.empty:
+        raise ValueError("硬路由 OOF 没有可用于选择的有限标签")
+    group_weights = fold_group_weights or {}
+    for prefix, weight in group_weights.items():
+        if not str(prefix) or not np.isfinite(float(weight)) or float(weight) <= 0.0:
+            raise ValueError("硬路由折组权重必须使用非空前缀和有限正数")
+
+    def select_winner(values: pd.DataFrame) -> tuple[str, float]:
+        if values.empty:
+            raise ValueError("硬路由无法在空训练折上选择冠军")
+        actual = values["y_true"].to_numpy(dtype=float)
+        denominator = np.maximum(np.abs(actual), 1.0e-6)
+        weights = _fold_row_weights(values, fold_column, group_weights)
+        losses = [
+            float(
+                np.average(
+                    np.abs(values[name].to_numpy(dtype=float) - actual) / denominator,
+                    weights=weights,
+                )
+            )
+            for name in names
+        ]
+        winner_index = int(np.argmin(np.asarray(losses, dtype=float)))
+        return names[winner_index], losses[winner_index]
+
+    final_winner, _ = select_winner(labeled)
+    cross_fitted = pd.Series(np.nan, index=subset.index, dtype=float)
+    report_rows: list[dict[str, object]] = []
+    for fold, held_out in subset.groupby(fold_column, sort=True):
+        training = labeled.loc[labeled[fold_column] != fold]
+        winner, selection_mape = select_winner(training)
+        predictions = held_out[winner].to_numpy(dtype=float)
+        cross_fitted.loc[held_out.index] = predictions
+
+        held_labeled = held_out.loc[
+            np.isfinite(held_out["y_true"].to_numpy(dtype=float))
+        ]
+        held_mape = np.nan
+        if not held_labeled.empty:
+            held_actual = held_labeled["y_true"].to_numpy(dtype=float)
+            held_mape = float(
+                np.mean(
+                    np.abs(held_labeled[winner].to_numpy(dtype=float) - held_actual)
+                    / np.maximum(np.abs(held_actual), 1.0e-6)
+                )
+            )
+        report_rows.append(
+            {
+                "fold": fold,
+                "winner": winner,
+                "selection_samples": len(training),
+                "selection_mape": selection_mape,
+                "held_out_samples": len(held_labeled),
+                "held_out_mape": held_mape,
+            }
+        )
+    if cross_fitted.isna().any():
+        raise ValueError("硬路由留一折预测未覆盖全部 OOF 样本")
+    return final_winner, cross_fitted, pd.DataFrame(report_rows)
+
+
+def _fit_regime_weight_map(
+    values: pd.DataFrame,
+    model_names: Sequence[str],
+    global_weights: np.ndarray,
+    *,
+    fold_column: str,
+    regime_column: str,
+    fold_group_weights: Mapping[str, float] | None,
+    minimum_samples: int,
+    shrinkage: float,
+) -> dict[str, np.ndarray]:
+    output: dict[str, np.ndarray] = {}
+    for regime, group in values.groupby(regime_column, sort=True):
+        if len(group) < int(minimum_samples):
+            continue
+        local = _nnls_weights(
+            group["y_true"].to_numpy(dtype=float),
+            group[list(model_names)].to_numpy(dtype=float),
+            _fold_row_weights(group, fold_column, fold_group_weights),
+        )
+        confidence = len(group) / (len(group) + max(float(shrinkage), 0.0))
+        blended = (1.0 - confidence) * global_weights + confidence * local
+        output[str(regime)] = blended / float(blended.sum())
+    return output
+
+
+def apply_regime_oof_weights(
+    predictions: Mapping[str, np.ndarray],
+    regimes: Sequence[str],
+    global_weights: Sequence[float],
+    regime_weights: Mapping[str, Sequence[float]],
+) -> np.ndarray:
+    """按样本工况应用权重，样本不足的工况自动回退到全局融合。"""
+
+    names = list(predictions)
+    matrix = np.column_stack(
+        [np.asarray(predictions[name], dtype=float) for name in names]
+    )
+    labels = np.asarray(regimes, dtype=object)
+    if matrix.shape[0] != len(labels) or matrix.shape[1] != len(global_weights):
+        raise ValueError("工况融合的样本数或候选数不一致")
+    output = np.empty(matrix.shape[0], dtype=float)
+    for regime in np.unique(labels):
+        mask = labels == regime
+        selected = np.asarray(
+            regime_weights.get(str(regime), global_weights), dtype=float
+        )
+        if (
+            len(selected) != matrix.shape[1]
+            or (selected < 0.0).any()
+            or not np.isfinite(selected).all()
+            or selected.sum() <= 0.0
+        ):
+            raise ValueError(f"工况 {regime} 的融合权重无效")
+        output[mask] = matrix[mask] @ (selected / selected.sum())
+    if not np.isfinite(output).all():
+        raise ValueError("工况融合预测包含缺失值或无穷值")
+    return output
+
+
+def fit_regime_oof_weights(
+    oof: pd.DataFrame,
+    model_names: Sequence[str],
+    *,
+    target_column: str,
+    horizon: int,
+    fold_column: str = "fold",
+    regime_column: str = "regime",
+    fold_group_weights: Mapping[str, float] | None = None,
+    minimum_samples: int = 96,
+    shrinkage: float = 192.0,
+) -> tuple[dict[str, np.ndarray], pd.Series, pd.DataFrame]:
+    """拟合工况软权重，并返回严格留一折的逐样本预测。"""
+
+    required = {
+        fold_column,
+        regime_column,
+        "target",
+        "horizon_steps",
+        "y_true",
+        *model_names,
+    }
+    missing = required.difference(oof.columns)
+    if missing:
+        raise ValueError(f"工况 OOF 数据缺少字段: {sorted(missing)}")
+    if int(minimum_samples) <= 0 or float(shrinkage) < 0.0:
+        raise ValueError("工况最小样本数必须为正且收缩强度不得为负")
+
+    subset = oof.loc[
+        (oof["target"].astype(str) == str(target_column))
+        & (oof["horizon_steps"].astype(int) == int(horizon))
+    ].copy()
+    finite = np.isfinite(subset[["y_true", *model_names]].to_numpy(dtype=float)).all(
+        axis=1
+    )
+    subset = subset.loc[finite & subset[regime_column].notna()]
+    if subset.empty:
+        raise ValueError(f"工况 OOF 缺少 {target_column} t+{horizon} 的有限样本")
+
+    global_weights = _nnls_weights(
+        subset["y_true"].to_numpy(dtype=float),
+        subset[list(model_names)].to_numpy(dtype=float),
+        _fold_row_weights(subset, fold_column, fold_group_weights),
+    )
+    final_weights = _fit_regime_weight_map(
+        subset,
+        model_names,
+        global_weights,
+        fold_column=fold_column,
+        regime_column=regime_column,
+        fold_group_weights=fold_group_weights,
+        minimum_samples=minimum_samples,
+        shrinkage=shrinkage,
+    )
+
+    cross_fitted = pd.Series(np.nan, index=subset.index, dtype=float)
+    report_rows: list[dict[str, object]] = []
+    for fold, held_out in subset.groupby(fold_column, sort=True):
+        training = subset.loc[subset[fold_column] != fold]
+        if training.empty:
+            continue
+        fold_global = _nnls_weights(
+            training["y_true"].to_numpy(dtype=float),
+            training[list(model_names)].to_numpy(dtype=float),
+            _fold_row_weights(training, fold_column, fold_group_weights),
+        )
+        fold_regimes = _fit_regime_weight_map(
+            training,
+            model_names,
+            fold_global,
+            fold_column=fold_column,
+            regime_column=regime_column,
+            fold_group_weights=fold_group_weights,
+            minimum_samples=minimum_samples,
+            shrinkage=shrinkage,
+        )
+        predictions = apply_regime_oof_weights(
+            {name: held_out[name].to_numpy(dtype=float) for name in model_names},
+            held_out[regime_column].astype(str).to_numpy(),
+            fold_global,
+            fold_regimes,
+        )
+        cross_fitted.loc[held_out.index] = predictions
+        for regime, group in held_out.assign(_prediction=predictions).groupby(
+            regime_column, sort=True
+        ):
+            denominator = np.maximum(
+                np.abs(group["y_true"].to_numpy(dtype=float)), 1.0e-6
+            )
+            report_rows.append(
+                {
+                    "fold": fold,
+                    "regime": str(regime),
+                    "samples": len(group),
+                    "mape": float(
+                        np.mean(
+                            np.abs(
+                                group["_prediction"].to_numpy(dtype=float)
+                                - group["y_true"].to_numpy(dtype=float)
+                            )
+                            / denominator
+                        )
+                    ),
+                    "specialized": str(regime) in fold_regimes,
+                    "weights": fold_regimes.get(str(regime), fold_global).tolist(),
+                }
+            )
+    if cross_fitted.isna().any():
+        raise ValueError("留一折工况融合未覆盖全部 OOF 样本")
+    return final_weights, cross_fitted, pd.DataFrame(report_rows)
 
 
 def apply_oof_weights(
@@ -171,10 +469,16 @@ def apply_oof_weights(
     if len(names) != len(weights):
         raise ValueError("融合候选数量与权重数量不一致")
     normalized = np.asarray(weights, dtype=float)
-    if (normalized < 0).any() or not np.isfinite(normalized).all() or normalized.sum() <= 0:
+    if (
+        (normalized < 0).any()
+        or not np.isfinite(normalized).all()
+        or normalized.sum() <= 0
+    ):
         raise ValueError("融合权重必须是有限非负数且和大于零")
     normalized = normalized / normalized.sum()
-    matrix = np.column_stack([np.asarray(predictions[name], dtype=float) for name in names])
+    matrix = np.column_stack(
+        [np.asarray(predictions[name], dtype=float) for name in names]
+    )
     output = matrix @ normalized
     if not np.isfinite(output).all():
         raise ValueError("融合预测包含缺失值或无穷值")
@@ -203,7 +507,13 @@ def fit_hourly_mape_calibration(
 ) -> dict[str, dict[str, float]]:
     """按目标、步长和目标时段拟合 MAPE 对齐的稳健乘法校准。"""
 
-    required = {"target", "horizon_steps", "target_datetime", "y_true", prediction_column_name}
+    required = {
+        "target",
+        "horizon_steps",
+        "target_datetime",
+        "y_true",
+        prediction_column_name,
+    }
     missing = required.difference(predictions.columns)
     if missing:
         raise ValueError(f"分时校准数据缺少字段: {sorted(missing)}")
@@ -221,7 +531,9 @@ def fit_hourly_mape_calibration(
         predicted = pd.to_numeric(
             group[prediction_column_name], errors="coerce"
         ).to_numpy(dtype=float)
-        finite = np.isfinite(actual) & np.isfinite(predicted) & (np.abs(predicted) > 1.0e-6)
+        finite = (
+            np.isfinite(actual) & np.isfinite(predicted) & (np.abs(predicted) > 1.0e-6)
+        )
         actual = actual[finite]
         predicted = predicted[finite]
         if len(actual) < int(minimum_samples):
@@ -318,7 +630,9 @@ def evaluate_oof_column_gate(
     values = subset[["y_true", baseline_column, candidate_column]].to_numpy(dtype=float)
     subset = subset.loc[np.isfinite(values).all(axis=1)]
     if subset.empty:
-        return ColumnGate(False, float("-inf"), float("-inf"), 0, 0, ("没有有限 OOF 样本",))
+        return ColumnGate(
+            False, float("-inf"), float("-inf"), 0, 0, ("没有有限 OOF 样本",)
+        )
     denominator = np.maximum(np.abs(subset["y_true"].to_numpy(dtype=float)), 1.0e-6)
     subset["baseline_ape"] = (
         np.abs(subset[baseline_column] - subset["y_true"]) / denominator
@@ -371,9 +685,15 @@ def evaluate_candidate_gate(
     merged = baseline.merge(candidate, on=keys, suffixes=("_baseline", "_candidate"))
     if merged.empty:
         raise ValueError("基线和候选没有可比较的 OOF 样本")
-    denominator = np.maximum(np.abs(merged["y_true_baseline"].to_numpy(dtype=float)), 1.0e-6)
-    merged["baseline_ape"] = np.abs(merged["y_pred_baseline"] - merged["y_true_baseline"]) / denominator
-    merged["candidate_ape"] = np.abs(merged["y_pred_candidate"] - merged["y_true_candidate"]) / denominator
+    denominator = np.maximum(
+        np.abs(merged["y_true_baseline"].to_numpy(dtype=float)), 1.0e-6
+    )
+    merged["baseline_ape"] = (
+        np.abs(merged["y_pred_baseline"] - merged["y_true_baseline"]) / denominator
+    )
+    merged["candidate_ape"] = (
+        np.abs(merged["y_pred_candidate"] - merged["y_true_candidate"]) / denominator
+    )
     fold_scores = merged.groupby(fold_column).agg(
         baseline_mape=("baseline_ape", "mean"), candidate_mape=("candidate_ape", "mean")
     )
@@ -381,11 +701,15 @@ def evaluate_candidate_gate(
     target_scores = merged.groupby(target_column).agg(
         baseline_mape=("baseline_ape", "mean"), candidate_mape=("candidate_ape", "mean")
     )
-    target_scores["gain"] = target_scores["baseline_mape"] - target_scores["candidate_mape"]
+    target_scores["gain"] = (
+        target_scores["baseline_mape"] - target_scores["candidate_mape"]
+    )
     recent_mean_gain = float(fold_scores["gain"].mean())
     recent_worst_gain = float(fold_scores["gain"].min())
     improved_folds = int((fold_scores["gain"] > 0.0).sum())
-    target_gains = {str(index): float(value) for index, value in target_scores["gain"].items()}
+    target_gains = {
+        str(index): float(value) for index, value in target_scores["gain"].items()
+    }
     # 门槛不得超过实际折数，否则折数少于门槛时永远无法通过。
     required_folds = min(int(minimum_improved_folds), len(fold_scores))
     reasons: list[str] = []
@@ -420,14 +744,18 @@ def project_forecasts(
     output = predictions.copy()
     for column in output.columns:
         if column.endswith("_pred"):
-            output[column] = pd.to_numeric(output[column], errors="coerce").clip(lower=0.0)
+            output[column] = pd.to_numeric(output[column], errors="coerce").clip(
+                lower=0.0
+            )
     if capacities:
         for target, capacity in capacities.items():
             for horizon in horizons:
                 column = f"{target}_t+{int(horizon) * 15}_pred"
                 if column in output:
                     output[column] = output[column].clip(upper=float(capacity))
-    if enforce_target_consistency and {"generator_1", "generator_all"}.issubset(target_columns):
+    if enforce_target_consistency and {"generator_1", "generator_all"}.issubset(
+        target_columns
+    ):
         for horizon in horizons:
             one = f"generator_1_t+{int(horizon) * 15}_pred"
             total = f"generator_all_t+{int(horizon) * 15}_pred"

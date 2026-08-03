@@ -66,6 +66,11 @@ preprocessing:
 features:
   lag_steps: [1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 24, 32, 48, 96, 192, 288, 672]
   rolling_windows: [4, 8, 16, 32, 96]
+  holder_momentum_enabled: true
+  gas_load_mismatch:
+    enabled: true
+    windows: [4, 8, 16]
+    minimum_load_mw: 1.0
 
 forecast:
   short_steps: 8
@@ -77,14 +82,6 @@ forecast:
     mode: scoring
     count: null
     file: null
-  deep_learning:
-    search_enabled: false
-    architectures: [tcn, patchtst]
-    context_candidates: [192, 384, 672]
-    coarse_folds: 4
-    coarse_epochs: 60
-    search_top_k: 2
-
 # 只使用训练期滚动验证进行模型决策；8 折覆盖不同月份和生产阶段。
 validation:
   mode: expanding
@@ -103,7 +100,7 @@ recent_validation:
 
 # 正式高分档；快速调试请使用 official_preliminary_fast.yaml。
 optuna:
-  # 25 分钟搜索上限为后续完整复核、8 折评分和提交生成预留时间。
+  # 25 分钟搜索上限为完整复核、8 折评分和提交生成预留时间。
   n_trials: 10
   n_startup_trials: 6
   top_k: 4
@@ -122,12 +119,38 @@ optuna:
 model_selection:
   recent_folds: 3
   cross_month_folds: 3
-  # 激进冲榜：近期折更贴近官方两天评分期，允许少量跨月退化。
-  minimum_non_degraded_folds: 3
-  maximum_worst_degradation: 0.03
+  # 14:13 线上高分版的三个主力试验作为不可缺失的验证基线。
+  incumbent_trial_numbers: [7, 4, 3]
+  # 10%/25% 时序 Mixup 双留出消融均未达到稳定提分门槛，正式运行不增加该候选。
+  fixed_challengers: []
+  candidate_gate:
+    recent_minimum_mean_gain: 0.001
+    recent_minimum_improved_folds: 3
+    recent_maximum_worst_degradation: 0.015
+    cross_month_minimum_mean_gain: 0.0
+    cross_month_minimum_improved_folds: 2
+    cross_month_maximum_worst_degradation: 0.015
+  minimum_non_degraded_folds: 4
+  maximum_worst_degradation: 0.015
   fold_group_weights:
     recent_: 3.0
     cross_month_: 1.0
+  regime_specialist:
+    enabled: false
+    online_threshold_mw: 1.0
+    stable_delta_threshold_mw: 2.0
+    minimum_samples: 96
+    # 高风险冲榜：弱收缩并允许少量月份退化，最终仍需通过相对最后值门控。
+    shrinkage: 32.0
+    minimum_mean_gain: 0.0
+    minimum_non_degraded_folds: 2
+    maximum_worst_degradation: 0.03
+  # 高风险冲榜：每个目标和步长仅保留训练期 OOF 最优模型，并用留一折结果门控。
+  hard_router:
+    enabled: false
+    minimum_mean_gain: 0.0
+    minimum_non_degraded_folds: 2
+    maximum_worst_degradation: 0.03
   baseline_candidates:
     - {name: damped_trend, type: damped_trend, window: 5, damping: 0.85}
     - {name: daily_naive, type: seasonal_naive, period_steps: 96}

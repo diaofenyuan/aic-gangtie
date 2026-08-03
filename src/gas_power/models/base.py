@@ -1,4 +1,4 @@
-"""短周期、长周期和未来深度模型共用的预测接口。"""
+"""短周期和长周期预测模型共用的预测接口。"""
 
 from __future__ import annotations
 
@@ -30,7 +30,7 @@ def prediction_columns(
 
 
 class ForecastModel(ABC):
-    """统一多目标、多步预测协议；PyTorch 模型可直接实现本接口。"""
+    """统一多目标、多步预测协议。"""
 
     @abstractmethod
     def fit(
@@ -70,32 +70,6 @@ class ForecastModel(ABC):
         callback: FitProgressCallback | None,
     ) -> None:
         """设置拟合进度回调；默认模型不提供细粒度进度。"""
-
-
-class TorchForecastAdapter(ForecastModel):
-    """为后续 PyTorch 时序网络保留的统一适配器，不引入强制 GPU 依赖。"""
-
-    def fit(
-        self,
-        frame: pd.DataFrame,
-        target_columns: Sequence[str],
-        horizons: Sequence[int],
-        train_end: pd.Timestamp | None = None,
-        *,
-        raw_targets: pd.DataFrame | None = None,
-        feature_matrix: pd.DataFrame | None = None,
-        data_source: str = "training",
-    ) -> "ForecastModel":
-        raise NotImplementedError("请在具体 PyTorch 模型中实现离线 fit，并继续遵循 ForecastModel")
-
-    def predict(
-        self,
-        frame: pd.DataFrame,
-        origins: pd.DatetimeIndex,
-        target_columns: Sequence[str],
-        horizons: Sequence[int],
-    ) -> pd.DataFrame:
-        raise NotImplementedError("请在具体 PyTorch 模型中实现因果 predict")
 
 
 def validate_prediction_request(

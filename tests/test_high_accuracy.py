@@ -6,7 +6,6 @@ from types import SimpleNamespace
 import numpy as np
 import pandas as pd
 import pytest
-import joblib
 from pandas.testing import assert_frame_equal
 
 from gas_power.config import load_config
@@ -23,8 +22,11 @@ from gas_power.data import (
 )
 from gas_power.ensemble_selection import (
     apply_oof_weights,
+    apply_regime_oof_weights,
     cross_fit_hourly_mape_calibration,
     evaluate_oof_column_gate,
+    fit_hard_oof_winner,
+    fit_regime_oof_weights,
     fit_oof_weights,
     fit_hourly_mape_calibration,
     mape_sample_weights,
@@ -33,7 +35,6 @@ from gas_power.ensemble_selection import (
 from gas_power.features import CausalFeatureBuilder
 from gas_power.models.baselines import LastValueModel
 from gas_power.models.boosting import BoostingMultiHorizonModel
-from gas_power.models.deep import NeuralResidualMultiHorizonModel
 from gas_power.models.factory import build_model
 from gas_power.models.parameterization import (
     ComponentReconstructionModel,
@@ -45,7 +46,11 @@ from gas_power.pipeline import (
     _selection_oof_local_entries,
 )
 from gas_power.scoring import ConfigurableScorer
-from gas_power.tuning import candidate_config_from_settings, select_diverse_trials_for_review
+from gas_power.tuning import (
+    _evaluate_selection_candidate_gate,
+    candidate_config_from_settings,
+    select_diverse_trials_for_review,
+)
 from gas_power.validation import RecentWindowSplitter, run_rolling_validation
 
 
@@ -83,14 +88,48 @@ def test_tuned_candidate_can_use_global_multi_horizon_strategy() -> None:
 
     assert candidate.section("forecast")["machine_learning"]["strategy"] == "global"
     assert candidate.section("residual_model")["strategy"] == "global"
-    assert build_model(candidate).fit_progress_steps(
-        ["generator_1", "generator_all"], list(range(1, 9))
-    ) == 2
+    assert (
+        build_model(candidate).fit_progress_steps(
+            ["generator_1", "generator_all"], list(range(1, 9))
+        )
+        == 2
+    )
+
+
+def test_candidate_gate_rejects_cross_month_target_degradation() -> None:
+    baseline = pd.DataFrame(
+        {
+            "fold": [0, 0],
+            "target": ["generator_1", "generator_all"],
+            "horizon_steps": [1, 1],
+            "y_true": [100.0, 100.0],
+            "y_pred": [110.0, 110.0],
+        }
+    )
+    recent = baseline.assign(y_pred=[105.0, 105.0])
+    cross_month = baseline.assign(y_pred=[115.0, 105.0])
+
+    gate = _evaluate_selection_candidate_gate(
+        baseline,
+        recent,
+        baseline,
+        cross_month,
+        {
+            "recent_minimum_improved_folds": 1,
+            "cross_month_minimum_improved_folds": 1,
+        },
+    )
+
+    assert gate.passed is False
+    assert gate.target_gains["cross_month:generator_1"] < 0.0
+    assert any("跨月留出" in reason for reason in gate.reasons)
 
 
 def test_submission_sources_drop_training_empty_columns_and_repair_missing() -> None:
     train_index = pd.date_range("2025-01-01", periods=120, freq="15min")
-    score_index = pd.date_range(train_index[-1] + pd.Timedelta(minutes=15), periods=8, freq="15min")
+    score_index = pd.date_range(
+        train_index[-1] + pd.Timedelta(minutes=15), periods=8, freq="15min"
+    )
     training = pd.DataFrame(
         {
             "valid": np.linspace(10.0, 20.0, len(train_index)),
@@ -107,7 +146,10 @@ def test_submission_sources_drop_training_empty_columns_and_repair_missing() -> 
     repaired, diagnostics = prepare_submission_sources(
         training,
         scoring,
-        {"imputation": {"method": "ffill", "limit": None}, "outliers": {"enabled": False}},
+        {
+            "imputation": {"method": "ffill", "limit": None},
+            "outliers": {"enabled": False},
+        },
         score_index,
         history_points=96,
     )
@@ -166,15 +208,11 @@ def test_submission_matrix_normalization_passes_strict_quality_gate() -> None:
     assert list(cleaned.columns) == ["feature_keep"]
     assert cleaned["feature_keep"].max() < 100.0
     assert diagnostics["winsorized_cells"] == 2
-    assert diagnostics["dropped_constant_columns_before_winsor"] == [
-        "feature_constant"
-    ]
+    assert diagnostics["dropped_constant_columns_before_winsor"] == ["feature_constant"]
     assert diagnostics["dropped_duplicate_columns_before_winsor"] == [
         "feature_duplicate"
     ]
-    assert diagnostics["dropped_constant_columns_after_winsor"] == [
-        "feature_zero_iqr"
-    ]
+    assert diagnostics["dropped_constant_columns_after_winsor"] == ["feature_zero_iqr"]
     assert diagnostics["passed"]
     assert diagnostics["clip_iqr_multiplier"] == 1.0
     assert diagnostics["final_quality"]["constant_columns"] == []
@@ -244,7 +282,9 @@ def test_validation_always_scores_against_explicit_raw_targets() -> None:
 
 def test_scoring_context_fill_and_future_perturbation_are_causal() -> None:
     train_index = pd.date_range("2025-01-01", periods=20, freq="15min")
-    scoring_index = pd.date_range(train_index[-1] + pd.Timedelta(minutes=15), periods=8, freq="15min")
+    scoring_index = pd.date_range(
+        train_index[-1] + pd.Timedelta(minutes=15), periods=8, freq="15min"
+    )
     training_frame = pd.DataFrame(
         {"generator_1": np.arange(20.0), "generator_all": np.arange(20.0) + 100.0},
         index=train_index,
@@ -254,20 +294,31 @@ def test_scoring_context_fill_and_future_perturbation_are_causal() -> None:
         index=scoring_index,
     )
     scoring_frame.loc[scoring_index[0], "generator_1"] = np.nan
-    settings = {"imputation": {"method": "ffill", "limit": 8}, "outliers": {"enabled": False}}
+    settings = {
+        "imputation": {"method": "ffill", "limit": 8},
+        "outliers": {"enabled": False},
+    }
     training = _prepared(training_frame, source="training")
     scoring = _prepared(scoring_frame, source="scoring")
-    baseline = prepare_scoring_with_history(training, scoring, settings, history_points=8)
-    assert baseline.model_input.at[scoring_index[0], "generator_1"] == training_frame.iloc[-1]["generator_1"]
+    baseline = prepare_scoring_with_history(
+        training, scoring, settings, history_points=8
+    )
+    assert (
+        baseline.model_input.at[scoring_index[0], "generator_1"]
+        == training_frame.iloc[-1]["generator_1"]
+    )
 
     perturbed_frame = scoring_frame.copy()
-    perturbed_frame.loc[scoring_index[4]:, "generator_all"] += 10_000.0
+    perturbed_frame.loc[scoring_index[4] :, "generator_all"] += 10_000.0
     candidate = prepare_scoring_with_history(
-        training, _prepared(perturbed_frame, source="scoring"), settings, history_points=8
+        training,
+        _prepared(perturbed_frame, source="scoring"),
+        settings,
+        history_points=8,
     )
     assert_frame_equal(
-        baseline.model_input.loc[:scoring_index[3]],
-        candidate.model_input.loc[:scoring_index[3]],
+        baseline.model_input.loc[: scoring_index[3]],
+        candidate.model_input.loc[: scoring_index[3]],
     )
 
 
@@ -387,7 +438,11 @@ def test_boosting_uses_raw_labels_and_records_training_source() -> None:
         index=index,
     )
     builder = CausalFeatureBuilder(
-        feature_config={"lag_steps": [1], "rolling_windows": [4], "rolling_statistics": ["mean"]},
+        feature_config={
+            "lag_steps": [1],
+            "rolling_windows": [4],
+            "rolling_statistics": ["mean"],
+        },
         roles={"targets": ["generator_1", "generator_all"]},
     )
     model = BoostingMultiHorizonModel(
@@ -415,7 +470,11 @@ def test_component_parameterization_reconstructs_total_target() -> None:
         index=index,
     )
     builder = CausalFeatureBuilder(
-        feature_config={"lag_steps": [1], "rolling_windows": [4], "rolling_statistics": ["mean"]},
+        feature_config={
+            "lag_steps": [1],
+            "rolling_windows": [4],
+            "rolling_statistics": ["mean"],
+        },
         roles={"targets": ["generator_1", "generator_all"]},
     )
     base = BoostingMultiHorizonModel(
@@ -440,7 +499,10 @@ def test_component_parameterization_reconstructs_total_target() -> None:
         [1],
     )
     assert np.isfinite(prediction.to_numpy()).all()
-    assert prediction.iloc[0]["generator_all_t+15_pred"] >= prediction.iloc[0]["generator_1_t+15_pred"]
+    assert (
+        prediction.iloc[0]["generator_all_t+15_pred"]
+        >= prediction.iloc[0]["generator_1_t+15_pred"]
+    )
 
 
 def test_gas_availability_model_predicts_resource_then_consistent_generation() -> None:
@@ -494,9 +556,7 @@ def test_gas_availability_model_predicts_resource_then_consistent_generation() -
     )
 
     origins = pd.DatetimeIndex(index[-4:])
-    prediction = model.predict(
-        frame, origins, ["generator_1", "generator_all"], [1, 2]
-    )
+    prediction = model.predict(frame, origins, ["generator_1", "generator_all"], [1, 2])
 
     assert prediction.shape == (4, 4)
     assert np.isfinite(prediction.to_numpy(dtype=float)).all()
@@ -566,7 +626,9 @@ def test_hourly_calibration_is_cross_fitted_and_reduces_stable_bias() -> None:
 
     assert np.allclose(calibrated.to_numpy(dtype=float), 105.0)
     assert set(factors) == {"generator_all_t+60_pred"}
-    assert all(np.isclose(value, 1.05) for value in factors["generator_all_t+60_pred"].values())
+    assert all(
+        np.isclose(value, 1.05) for value in factors["generator_all_t+60_pred"].values()
+    )
 
 
 def test_selection_fold_combination_requires_aligned_four_plus_four_folds() -> None:
@@ -618,8 +680,14 @@ def test_review_selection_keeps_best_trial_from_each_parameterization() -> None:
     ]
 
     selected = select_diverse_trials_for_review(trials, top_k=5)
+    preferred = select_diverse_trials_for_review(
+        trials,
+        top_k=4,
+        preferred_parameterizations=["gas_availability"],
+    )
 
     assert [trial.number for trial in selected] == [0, 1, 2, 3, 4]
+    assert [trial.number for trial in preferred] == [0, 1, 2, 4]
 
 
 def test_review_selection_keeps_target_and_column_specialists() -> None:
@@ -628,7 +696,10 @@ def test_review_selection_keeps_target_and_column_specialists() -> None:
             number=0,
             value=0.040,
             user_attrs={
-                "candidate_config": {"parameterization": "component", "strategy": "direct"},
+                "candidate_config": {
+                    "parameterization": "component",
+                    "strategy": "direct",
+                },
                 "target_mape": {"generator_1": 0.060, "generator_all": 0.020},
                 "column_mape": {"generator_1_h1": 0.060, "generator_all_h1": 0.020},
             },
@@ -637,7 +708,10 @@ def test_review_selection_keeps_target_and_column_specialists() -> None:
             number=1,
             value=0.041,
             user_attrs={
-                "candidate_config": {"parameterization": "direct", "strategy": "direct"},
+                "candidate_config": {
+                    "parameterization": "direct",
+                    "strategy": "direct",
+                },
                 "target_mape": {"generator_1": 0.030, "generator_all": 0.052},
                 "column_mape": {"generator_1_h1": 0.030, "generator_all_h1": 0.052},
             },
@@ -646,7 +720,10 @@ def test_review_selection_keeps_target_and_column_specialists() -> None:
             number=2,
             value=0.042,
             user_attrs={
-                "candidate_config": {"parameterization": "direct", "strategy": "global"},
+                "candidate_config": {
+                    "parameterization": "direct",
+                    "strategy": "global",
+                },
                 "target_mape": {"generator_1": 0.045, "generator_all": 0.018},
                 "column_mape": {"generator_1_h1": 0.045, "generator_all_h1": 0.018},
             },
@@ -687,6 +764,105 @@ def test_recent_fold_weight_moves_fusion_toward_recent_specialist() -> None:
     assert aggressive[1] > equal[1]
 
 
+def test_regime_oof_weights_cross_fit_without_held_out_labels() -> None:
+    rows: list[dict[str, object]] = []
+    for fold in ("recent_0", "cross_month_0"):
+        for regime in ("stable", "ramp_up"):
+            for _ in range(32):
+                rows.append(
+                    {
+                        "fold": fold,
+                        "target": "generator_1",
+                        "horizon_steps": 1,
+                        "regime": regime,
+                        "y_true": 100.0,
+                        "stable_model": 100.0 if regime == "stable" else 120.0,
+                        "ramp_model": 120.0 if regime == "stable" else 100.0,
+                    }
+                )
+    oof = pd.DataFrame(rows)
+
+    weights, cross_fitted, report = fit_regime_oof_weights(
+        oof,
+        ["stable_model", "ramp_model"],
+        target_column="generator_1",
+        horizon=1,
+        minimum_samples=24,
+        shrinkage=0.0,
+    )
+    fitted = apply_regime_oof_weights(
+        {
+            "stable_model": oof["stable_model"].to_numpy(),
+            "ramp_model": oof["ramp_model"].to_numpy(),
+        },
+        oof["regime"].to_numpy(),
+        [0.5, 0.5],
+        weights,
+    )
+
+    assert weights["stable"][0] > 0.99
+    assert weights["ramp_up"][1] > 0.99
+    assert np.allclose(cross_fitted, 100.0)
+    assert np.allclose(fitted, 100.0)
+    assert set(report["fold"]) == {"recent_0", "cross_month_0"}
+    assert report["specialized"].all()
+
+
+def test_hard_oof_winner_cross_fit_without_held_out_labels() -> None:
+    rows: list[dict[str, object]] = []
+    for fold, actual in (
+        ("recent_0", 100.0),
+        ("cross_month_0", 120.0),
+        ("cross_month_1", 120.0),
+    ):
+        for _ in range(8):
+            rows.append(
+                {
+                    "fold": fold,
+                    "target": "generator_1",
+                    "horizon_steps": 1,
+                    "y_true": actual,
+                    "model_a": 100.0,
+                    "model_b": 120.0,
+                }
+            )
+    oof = pd.DataFrame(rows)
+    oof.loc[0, "y_true"] = np.nan
+    settings = {"recent_": 3.0, "cross_month_": 1.0}
+
+    winner, cross_fitted, report = fit_hard_oof_winner(
+        oof,
+        ["model_a", "model_b"],
+        target_column="generator_1",
+        horizon=1,
+        fold_group_weights=settings,
+    )
+    changed = oof.copy()
+    changed.loc[changed["fold"] == "recent_0", "y_true"] = 50.0
+    _, changed_cross_fitted, changed_report = fit_hard_oof_winner(
+        changed,
+        ["model_a", "model_b"],
+        target_column="generator_1",
+        horizon=1,
+        fold_group_weights=settings,
+    )
+
+    recent_mask = oof["fold"] == "recent_0"
+    assert winner == "model_a"
+    assert np.isfinite(cross_fitted.to_numpy()).all()
+    assert np.array_equal(
+        cross_fitted.loc[recent_mask].to_numpy(),
+        changed_cross_fitted.loc[recent_mask].to_numpy(),
+    )
+    recent_report = report.loc[report["fold"] == "recent_0"].iloc[0]
+    changed_recent_report = changed_report.loc[
+        changed_report["fold"] == "recent_0"
+    ].iloc[0]
+    assert recent_report["winner"] == "model_b"
+    assert changed_recent_report["winner"] == recent_report["winner"]
+    assert set(report["fold"]) == {"recent_0", "cross_month_0", "cross_month_1"}
+
+
 def test_selection_oof_entries_replace_baseline_score_source(tmp_path: Path) -> None:
     path = tmp_path / "selection.csv"
     pd.DataFrame(
@@ -707,56 +883,3 @@ def test_selection_oof_entries_replace_baseline_score_source(tmp_path: Path) -> 
     assert entries["recent"]["folds"] == 1
     assert entries["recent"]["score"]["score_percent"] == pytest.approx(98.0)
     assert entries["cross_month"]["score"]["score_percent"] == pytest.approx(96.0)
-
-
-@pytest.mark.parametrize("architecture", ["tcn", "patchtst"])
-def test_deep_model_round_trip_preserves_predictions(
-    architecture: str, tmp_path
-) -> None:
-    index = pd.date_range("2025-01-01", periods=96, freq="15min")
-    phase = np.arange(len(index), dtype=float)
-    frame = pd.DataFrame(
-        {
-            "generator_1": 80.0 + np.sin(phase / 5.0),
-            "generator_all": 190.0 + np.cos(phase / 7.0),
-        },
-        index=index,
-    )
-    builder = CausalFeatureBuilder(
-        feature_config={
-            "lag_steps": [1, 2],
-            "rolling_windows": [4],
-            "rolling_statistics": ["mean"],
-        },
-        roles={"targets": ["generator_1", "generator_all"]},
-    )
-    model = NeuralResidualMultiHorizonModel(
-        architecture=architecture,
-        feature_builder=builder,
-        context_steps=8,
-        epochs=2,
-        patience=1,
-        batch_size=16,
-        hidden_size=8,
-        patch_size=4,
-        seeds=[7],
-        device="cpu",
-    )
-    model.fit(
-        frame.iloc[:80],
-        ["generator_1", "generator_all"],
-        [1, 2],
-        raw_targets=frame.iloc[:80][["generator_1", "generator_all"]],
-    )
-    origins = pd.DatetimeIndex([index[80], index[81]])
-    expected = model.predict(
-        frame, origins, ["generator_1", "generator_all"], [1, 2]
-    )
-    model_path = tmp_path / f"{architecture}.joblib"
-    joblib.dump(model, model_path)
-    restored = joblib.load(model_path)
-    actual = restored.predict(
-        frame, origins, ["generator_1", "generator_all"], [1, 2]
-    )
-    assert_frame_equal(actual, expected, check_exact=True)
-    assert np.isfinite(actual.to_numpy(dtype=float)).all()

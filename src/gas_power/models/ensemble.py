@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 
 from gas_power.models.base import ForecastModel, prediction_column
+from gas_power.regimes import infer_regimes_from_history, prediction_column_targets
 
 
 class WeightedEnsembleModel(ForecastModel):
@@ -61,7 +62,11 @@ class WeightedEnsembleModel(ForecastModel):
         weighted: pd.DataFrame | None = None
         for model, weight in self.components:
             prediction = model.predict(frame, origins, target_columns, horizons)
-            weighted = prediction * weight if weighted is None else weighted.add(prediction * weight)
+            weighted = (
+                prediction * weight
+                if weighted is None
+                else weighted.add(prediction * weight)
+            )
         if weighted is None:
             raise RuntimeError("融合模型没有产生预测")
         if self.clip_min is not None:
@@ -72,12 +77,17 @@ class WeightedEnsembleModel(ForecastModel):
 
 
 class HorizonWeightedEnsembleModel(ForecastModel):
-    """按目标×步长使用训练期 OOF 学得的非负权重。"""
+    """按目标、步长及可选工况使用训练期 OOF 学得的非负权重。"""
 
     def __init__(
         self,
         components: Mapping[str, ForecastModel],
         column_weights: Mapping[str, Mapping[str, float]],
+        *,
+        regime_column_weights: Mapping[str, Mapping[str, Mapping[str, float]]]
+        | None = None,
+        online_threshold_mw: float = 1.0,
+        stable_delta_threshold_mw: float = 2.0,
     ):
         if not components:
             raise ValueError("OOF 融合至少需要一个子模型")
@@ -86,12 +96,42 @@ class HorizonWeightedEnsembleModel(ForecastModel):
             str(column): {str(name): float(weight) for name, weight in weights.items()}
             for column, weights in column_weights.items()
         }
+        self.regime_column_weights = {
+            str(column): {
+                str(regime): {
+                    str(name): float(weight) for name, weight in weights.items()
+                }
+                for regime, weights in regimes.items()
+            }
+            for column, regimes in (regime_column_weights or {}).items()
+        }
+        self.online_threshold_mw = float(online_threshold_mw)
+        self.stable_delta_threshold_mw = float(stable_delta_threshold_mw)
         for column, weights in self.column_weights.items():
             unknown = set(weights).difference(self.components)
             if unknown:
                 raise ValueError(f"融合列 {column} 引用了未知模型: {sorted(unknown)}")
-            if any(weight < 0.0 for weight in weights.values()) or sum(weights.values()) <= 0.0:
+            if (
+                any(weight < 0.0 for weight in weights.values())
+                or sum(weights.values()) <= 0.0
+            ):
                 raise ValueError(f"融合列 {column} 的权重必须非负且和大于零")
+        for column, regimes in self.regime_column_weights.items():
+            if column not in self.column_weights:
+                raise ValueError(f"工况融合列 {column} 缺少全局回退权重")
+            for regime, weights in regimes.items():
+                unknown = set(weights).difference(self.components)
+                if unknown:
+                    raise ValueError(
+                        f"工况融合列 {column}/{regime} 引用了未知模型: {sorted(unknown)}"
+                    )
+                if (
+                    any(weight < 0.0 for weight in weights.values())
+                    or sum(weights.values()) <= 0.0
+                ):
+                    raise ValueError(
+                        f"工况融合列 {column}/{regime} 的权重必须非负且和大于零"
+                    )
 
     def fit(
         self,
@@ -128,17 +168,47 @@ class HorizonWeightedEnsembleModel(ForecastModel):
             for name, model in self.components.items()
         }
         expected_columns = next(iter(predictions.values())).columns
+        column_targets = prediction_column_targets(target_columns, horizons)
+        regimes_by_target = {
+            str(target): infer_regimes_from_history(
+                frame,
+                origins,
+                str(target),
+                online_threshold_mw=self.online_threshold_mw,
+                stable_delta_threshold_mw=self.stable_delta_threshold_mw,
+            )
+            for target in target_columns
+        }
         output = pd.DataFrame(index=origins)
         output.index.name = "datetime"
         for column in expected_columns:
             weights = self.column_weights.get(str(column))
             if not weights:
                 raise ValueError(f"缺少预测列的 OOF 融合权重: {column}")
-            total = float(sum(weights.values()))
-            output[column] = sum(
-                predictions[name][column] * (weight / total)
-                for name, weight in weights.items()
-            )
+            regime_weights = self.regime_column_weights.get(str(column), {})
+            if not regime_weights:
+                total = float(sum(weights.values()))
+                output[column] = sum(
+                    predictions[name][column] * (weight / total)
+                    for name, weight in weights.items()
+                )
+                continue
+
+            target = column_targets.get(str(column))
+            if target is None:
+                raise ValueError(f"无法确定工况融合列对应的目标: {column}")
+            labels = regimes_by_target[target]
+            values = np.empty(len(origins), dtype=float)
+            for regime in labels.unique():
+                mask = labels.to_numpy(dtype=object) == str(regime)
+                selected = regime_weights.get(str(regime), weights)
+                total = float(sum(selected.values()))
+                values[mask] = sum(
+                    predictions[name][column].to_numpy(dtype=float)[mask]
+                    * (weight / total)
+                    for name, weight in selected.items()
+                )
+            output[column] = values
         if not np.isfinite(output.to_numpy(dtype=float)).all():
             raise ValueError("OOF 融合结果包含缺失值或无穷值")
         return output
@@ -157,7 +227,9 @@ class HourlyCalibratedModel(ForecastModel):
     ):
         self.base_model = base_model
         self.calibrations = {
-            str(column): {str(hour_bin): float(factor) for hour_bin, factor in bins.items()}
+            str(column): {
+                str(hour_bin): float(factor) for hour_bin, factor in bins.items()
+            }
             for column, bins in calibrations.items()
         }
         self.hour_bin_size = int(hour_bin_size)

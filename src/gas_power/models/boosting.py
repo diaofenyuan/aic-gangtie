@@ -162,6 +162,11 @@ class BoostingMultiHorizonModel(ForecastModel):
         values["feat_target_time_week_sin"] = np.sin(week_angle)
         values["feat_target_time_week_cos"] = np.cos(week_angle)
         values["feat_target_time_hour"] = target_index.hour.astype(np.int8)
+        values["feat_target_time_minute"] = target_index.minute.astype(np.int8)
+        values["feat_target_time_slot"] = (
+            minute_of_day // self.interval_minutes
+        ).astype(np.int16)
+        values["feat_target_time_month"] = target_index.month.astype(np.int8)
         values["feat_target_time_dayofweek"] = target_index.dayofweek.astype(np.int8)
         values["feat_target_time_is_weekend"] = (target_index.dayofweek >= 5).astype(np.int8)
         return values
@@ -209,6 +214,8 @@ class BoostingMultiHorizonModel(ForecastModel):
             "train_end": str(end),
             "raw_labels": True,
             "sample_weighting": dict(self.sample_weighting),
+            "training_rows_before_augmentation": 0,
+            "augmented_training_rows": 0,
             "constant_response_models": [],
         }
         if self.target_mode == "residual" and self.baseline_model is not None:
@@ -322,7 +329,116 @@ class BoostingMultiHorizonModel(ForecastModel):
             index=x.index,
             dtype=float,
         )
+        self.training_metadata_["training_rows_before_augmentation"] += len(x)
+        x, y, weight, augmented_rows = self._augment_training_slice(
+            frame,
+            target,
+            horizon,
+            x,
+            y,
+            weight,
+            train_end,
+        )
+        self.training_metadata_["augmented_training_rows"] += augmented_rows
         return x, y, weight
+
+    def _augment_training_slice(
+        self,
+        frame: pd.DataFrame,
+        target: str,
+        horizon: int,
+        x: pd.DataFrame,
+        y: pd.Series,
+        weight: pd.Series,
+        train_end: pd.Timestamp,
+    ) -> tuple[pd.DataFrame, pd.Series, pd.Series, int]:
+        """在单个训练折内对相邻同工况样本做局部 Mixup。"""
+
+        ratio = float(self.sample_weighting.get("temporal_mixup_ratio", 0.0))
+        if ratio == 0.0:
+            return x, y, weight, 0
+        if not 0.0 < ratio <= 1.0:
+            raise ValueError("temporal_mixup_ratio 必须位于 (0, 1] 区间")
+        minimum_lambda = float(
+            self.sample_weighting.get("temporal_mixup_min_lambda", 0.70)
+        )
+        maximum_lambda = float(
+            self.sample_weighting.get("temporal_mixup_max_lambda", 0.90)
+        )
+        if not 0.5 <= minimum_lambda <= maximum_lambda < 1.0:
+            raise ValueError("Mixup 插值系数必须满足 0.5 <= min <= max < 1")
+
+        current = pd.to_numeric(frame[target], errors="coerce").reindex(x.index)
+        previous = pd.to_numeric(frame[target], errors="coerce").shift(1).reindex(x.index)
+        online_threshold = float(
+            self.sample_weighting.get("regime_online_threshold_mw", 1.0)
+        )
+        stable_threshold = float(
+            self.sample_weighting.get("regime_stable_delta_threshold_mw", 2.0)
+        )
+        current_online = current > online_threshold
+        previous_online = previous > online_threshold
+        delta = current - previous
+        regimes = np.select(
+            [
+                current_online & ~previous_online,
+                ~current_online & previous_online,
+                current_online & (delta > stable_threshold),
+                current_online & (delta < -stable_threshold),
+                current_online,
+            ],
+            ["startup", "shutdown", "ramp_up", "ramp_down", "stable"],
+            default="offline",
+        )
+        time_gap = pd.Series(x.index, index=x.index).diff()
+        adjacent = time_gap.eq(pd.Timedelta(minutes=self.interval_minutes)).to_numpy()
+        same_regime = np.r_[False, regimes[1:] == regimes[:-1]]
+        eligible_positions = np.flatnonzero(adjacent & same_regime)
+        augmented_rows = min(int(round(len(x) * ratio)), len(eligible_positions))
+        if augmented_rows <= 0:
+            return x, y, weight, 0
+
+        stable_target_seed = sum((index + 1) * ord(char) for index, char in enumerate(target))
+        timestamp_seed = int(pd.Timestamp(train_end).value // 10**9)
+        random_seed = (
+            self.seed + 1009 * int(horizon) + stable_target_seed + timestamp_seed
+        ) % (2**32)
+        generator = np.random.default_rng(random_seed)
+        selected = np.sort(
+            generator.choice(eligible_positions, size=augmented_rows, replace=False)
+        )
+        blend = generator.uniform(
+            minimum_lambda, maximum_lambda, size=augmented_rows
+        )
+
+        left = x.iloc[selected].to_numpy(dtype=float)
+        right = x.iloc[selected - 1].to_numpy(dtype=float)
+        mixed = blend[:, None] * left + (1.0 - blend[:, None]) * right
+        mixed = np.where(
+            np.isfinite(left) & ~np.isfinite(right),
+            left,
+            np.where(~np.isfinite(left) & np.isfinite(right), right, mixed),
+        )
+        augmented_x = pd.DataFrame(mixed, columns=x.columns)
+        y_values = y.to_numpy(dtype=float)
+        augmented_y = pd.Series(
+            blend * y_values[selected] + (1.0 - blend) * y_values[selected - 1],
+            dtype=float,
+        )
+        weight_values = weight.to_numpy(dtype=float)
+        augmented_weight = pd.Series(
+            blend * weight_values[selected]
+            + (1.0 - blend) * weight_values[selected - 1],
+            dtype=float,
+        )
+
+        combined_x = pd.concat([x.reset_index(drop=True), augmented_x], ignore_index=True)
+        combined_y = pd.concat([y.reset_index(drop=True), augmented_y], ignore_index=True)
+        combined_weight = pd.concat(
+            [weight.reset_index(drop=True), augmented_weight], ignore_index=True
+        )
+        combined_weight = combined_weight / float(combined_weight.mean())
+        return combined_x, combined_y, combined_weight, augmented_rows
 
     def predict(
         self,

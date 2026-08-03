@@ -65,3 +65,21 @@ def test_forecast_and_optimization_outputs_are_revalidated(tmp_path) -> None:
     )
     assert list(checked_plan.columns) == ["datetime", *gas_columns]
 
+
+def test_preliminary_forecast_schema_stays_at_17_columns(tmp_path) -> None:
+    index = pd.date_range("2025-05-01", periods=2, freq="15min")
+    targets = ["generator_1", "generator_all"]
+    horizons = list(range(1, 9))
+    columns = prediction_columns(targets, horizons)
+    forecast = pd.DataFrame(1.0, index=index, columns=columns)
+
+    checked = write_forecast_csv(
+        forecast,
+        tmp_path / "s_result.csv",
+        targets,
+        horizons,
+    )
+
+    assert checked.shape[1] == 17
+    assert list(checked.columns) == ["datetime", *columns]
+    assert not any(str(column).startswith("feat_") for column in checked.columns)

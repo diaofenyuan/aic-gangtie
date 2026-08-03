@@ -5,7 +5,7 @@ import pandas as pd
 from sklearn.ensemble import HistGradientBoostingRegressor
 
 from gas_power.features import CausalFeatureBuilder
-from gas_power.gpu_gate import evaluate_gpu_gate, evaluate_residual_gate
+from gas_power.gpu_gate import evaluate_residual_gate
 from gas_power.models.base import prediction_columns
 from gas_power.models.baselines import LastValueModel
 from gas_power.models.boosting import BoostingMultiHorizonModel
@@ -66,19 +66,7 @@ def test_residual_route_and_physical_postprocessing_run_on_cpu() -> None:
     assert result.predictions[columns[:2]].to_numpy().max() <= 50.0
 
 
-def test_gpu_and_residual_gates_require_all_fold_evidence() -> None:
-    blocked = evaluate_gpu_gate(
-        {"enabled": True, "require_cpu_baselines_complete": True, "min_gain_all_folds": 0.01},
-        cpu_baselines_complete=False,
-        fold_gains=[0.02, 0.03],
-    )
-    assert blocked.allowed is False
-    allowed = evaluate_gpu_gate(
-        {"enabled": True, "require_cpu_baselines_complete": True, "min_gain_all_folds": 0.01},
-        cpu_baselines_complete=True,
-        fold_gains=[0.02, 0.03],
-    )
-    assert allowed.allowed is True
+def test_residual_gate_requires_all_fold_evidence() -> None:
     residual = evaluate_residual_gate(
         {"require_all_folds_improved": True, "min_fold_mape_gain": 0.001},
         [0.002, -0.001],

@@ -22,9 +22,13 @@ def test_default_config_marks_unconfirmed_parameters() -> None:
     optimization = config.section("optimization")
     for gas_type, settings in optimization["gas_types"].items():
         conversion = settings["conversion_mw_per_volume"]
-        assert configured_value(
-            conversion, f"optimization.gas_types.{gas_type}.conversion_mw_per_volume"
-        ) > 0
+        assert (
+            configured_value(
+                conversion,
+                f"optimization.gas_types.{gas_type}.conversion_mw_per_volume",
+            )
+            > 0
+        )
         assert "等待" in conversion["status"]
     for parameter in optimization["objective"].values():
         assert "等待" in parameter["status"]
@@ -54,13 +58,11 @@ def test_official_preliminary_config_uses_isolated_official_paths() -> None:
     assert config.section("competition_compliance")["stage"] == "preliminary"
     assert config.path("data") == PROJECT_ROOT / "data" / "preliminary" / "train"
     assert (
-        config.path("scoring_data")
-        == PROJECT_ROOT / "data" / "preliminary" / "scoring"
+        config.path("scoring_data") == PROJECT_ROOT / "data" / "preliminary" / "scoring"
     )
     assert config.section("data")["tables"]["load"]["path"] == "Pre_load.csv"
     assert (
-        config.section("prediction_input")["table_paths"]["load"]
-        == "Pre_test_load.csv"
+        config.section("prediction_input")["table_paths"]["load"] == "Pre_test_load.csv"
     )
     assert config.section("forecast")["model"]["type"] == "last_value"
     assert config.section("forecast")["model"]["components"] == []
@@ -83,8 +85,17 @@ def test_official_tuning_budget_is_bounded_and_keeps_full_month_validation() -> 
     assert tuning["n_estimators_min"] == 150
     assert tuning["n_estimators_max"] == 750
     assert tuning["catboost_iterations_max"] == 225
-    assert config.raw["model_selection"]["fold_group_weights"]["recent_"] == 3.0
-    assert config.raw["model_selection"]["hourly_calibration"]["enabled"] is False
+    selection = config.raw["model_selection"]
+    assert selection["fold_group_weights"]["recent_"] == 3.0
+    assert selection["incumbent_trial_numbers"] == [7, 4, 3]
+    assert selection["fixed_challengers"] == []
+    assert selection["regime_specialist"]["enabled"] is False
+    assert selection["hard_router"]["enabled"] is False
+    assert "holder_capacity" not in config.section("features")
+    calibration = config.raw["model_selection"]["hourly_calibration"]
+    assert calibration["enabled"] is False
+    assert calibration["hour_bin_size"] == 4
+    assert calibration["shrinkage"] == 48
     assert config.section("recent_validation")["folds"] == 8
     assert config.section("validation")["folds"] == 8
 
@@ -112,7 +123,9 @@ def test_official_input_keeps_all_raw_fields_with_original_names() -> None:
     assert not any(str(column).startswith("feat_") for column in frame)
 
 
-def test_official_config_rejects_scoring_directory_as_training_data(tmp_path: Path) -> None:
+def test_official_config_rejects_scoring_directory_as_training_data(
+    tmp_path: Path,
+) -> None:
     source = PROJECT_ROOT / "config" / "official_preliminary.yaml"
     with source.open("r", encoding="utf-8") as stream:
         raw = yaml.safe_load(stream)

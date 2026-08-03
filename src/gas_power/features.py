@@ -45,7 +45,9 @@ def _flatten_role_columns(roles: Mapping[str, Any]) -> list[str]:
     return list(dict.fromkeys(_role_columns(roles)))
 
 
-def _sum_role_series(frame: pd.DataFrame, value: Any) -> tuple[pd.Series | None, list[str]]:
+def _sum_role_series(
+    frame: pd.DataFrame, value: Any
+) -> tuple[pd.Series | None, list[str]]:
     columns = [column for column in _role_columns(value) if column in frame]
     if not columns:
         return None, []
@@ -63,7 +65,9 @@ class CausalFeatureBuilder:
     availability: FeatureAvailabilityRegistry | None = None
     model_scope: str = "long"
 
-    def _source_allowed(self, source_field: str, lag_steps: int, feature_name: str) -> bool:
+    def _source_allowed(
+        self, source_field: str, lag_steps: int, feature_name: str
+    ) -> bool:
         if self.availability is None:
             return True
         usage = FeatureUsage(
@@ -72,9 +76,12 @@ class CausalFeatureBuilder:
             source_offset_steps=-int(lag_steps),
             scope=self.model_scope,
         )
-        return self.availability.validate_usage(
-            usage, pd.Timestamp("2000-01-01"), self.interval_minutes
-        ) is None
+        return (
+            self.availability.validate_usage(
+                usage, pd.Timestamp("2000-01-01"), self.interval_minutes
+            )
+            is None
+        )
 
     def progress_steps(self) -> int:
         """返回特征构建可汇报的工作项数量。"""
@@ -126,12 +133,19 @@ class CausalFeatureBuilder:
     ) -> None:
         minute_of_day = index.hour * 60 + index.minute
         day_angle = 2.0 * np.pi * minute_of_day / 1440.0
-        week_angle = 2.0 * np.pi * (index.dayofweek * 1440 + minute_of_day) / (7.0 * 1440.0)
+        week_angle = (
+            2.0 * np.pi * (index.dayofweek * 1440 + minute_of_day) / (7.0 * 1440.0)
+        )
         result["feat_time_day_sin"] = np.sin(day_angle)
         result["feat_time_day_cos"] = np.cos(day_angle)
         result["feat_time_week_sin"] = np.sin(week_angle)
         result["feat_time_week_cos"] = np.cos(week_angle)
         result["feat_time_hour"] = index.hour.astype(np.int8)
+        result["feat_time_minute"] = index.minute.astype(np.int8)
+        result["feat_time_slot"] = (minute_of_day // self.interval_minutes).astype(
+            np.int16
+        )
+        result["feat_time_month"] = index.month.astype(np.int8)
         result["feat_time_dayofweek"] = index.dayofweek.astype(np.int8)
         result["feat_time_is_weekend"] = (index.dayofweek >= 5).astype(np.int8)
 
@@ -150,11 +164,15 @@ class CausalFeatureBuilder:
             else:
                 result[existing] = frame[column].isna().astype(np.int8)
         if "feat_time_gap_inserted" in frame:
-            result["feat_time_gap_inserted"] = frame["feat_time_gap_inserted"].astype(np.int8)
+            result["feat_time_gap_inserted"] = frame["feat_time_gap_inserted"].astype(
+                np.int8
+            )
         # 清洗层生成的缺失连续长度、异常标记和稳健值均已是因果特征。
         for column in frame.columns:
             name = str(column)
-            if name.startswith(("feat_missing_run__", "feat_outlier__", "feat_robust__")):
+            if name.startswith(
+                ("feat_missing_run__", "feat_outlier__", "feat_robust__")
+            ):
                 source_name = name.split("__", 1)[-1]
                 if self._source_allowed(source_name, 0, name):
                     result[name] = pd.to_numeric(frame[column], errors="coerce")
@@ -167,8 +185,12 @@ class CausalFeatureBuilder:
         progress_callback: Callable[[str], None] | None = None,
     ) -> None:
         lag_steps = [int(value) for value in self.feature_config.get("lag_steps", [])]
-        windows = [int(value) for value in self.feature_config.get("rolling_windows", [])]
-        statistics = {str(value) for value in self.feature_config.get("rolling_statistics", [])}
+        windows = [
+            int(value) for value in self.feature_config.get("rolling_windows", [])
+        ]
+        statistics = {
+            str(value) for value in self.feature_config.get("rolling_statistics", [])
+        }
 
         for column in base_columns:
             if column not in frame:
@@ -240,8 +262,16 @@ class CausalFeatureBuilder:
                     process_series, process_columns = _sum_role_series(
                         frame, process_demand[gas_type]
                     )
-                demand_parts = [series for series in (user_series, process_series) if series is not None]
-                demand_series = sum(demand_parts[1:], demand_parts[0].copy()) if demand_parts else None
+                demand_parts = [
+                    series
+                    for series in (user_series, process_series)
+                    if series is not None
+                ]
+                demand_series = (
+                    sum(demand_parts[1:], demand_parts[0].copy())
+                    if demand_parts
+                    else None
+                )
                 demand_columns = [*user_columns, *process_columns]
                 feature_name = f"feat_gas_balance_{gas_type}"
                 if (
@@ -256,9 +286,15 @@ class CausalFeatureBuilder:
                     shifted_balance = raw_balance.shift(1)
                     gas_balances[str(gas_type)] = raw_balance
                     result[feature_name] = shifted_balance
-                    result[f"feat_gas_production_{gas_type}"] = production_series.shift(1)
-                    result[f"feat_gas_priority_demand_{gas_type}"] = demand_series.shift(1)
-                    result[f"feat_gas_supply_gap_{gas_type}"] = (-shifted_balance).clip(lower=0.0)
+                    result[f"feat_gas_production_{gas_type}"] = production_series.shift(
+                        1
+                    )
+                    result[f"feat_gas_priority_demand_{gas_type}"] = (
+                        demand_series.shift(1)
+                    )
+                    result[f"feat_gas_supply_gap_{gas_type}"] = (-shifted_balance).clip(
+                        lower=0.0
+                    )
                     result[f"feat_gas_production_demand_ratio_{gas_type}"] = (
                         production_series / demand_series.replace(0.0, np.nan)
                     ).shift(1)
@@ -269,7 +305,9 @@ class CausalFeatureBuilder:
                         prefix = f"feat_gas_balance_{gas_type}_{window}"
                         result[f"{prefix}_mean"] = rolling.mean()
                         result[f"{prefix}_std"] = rolling.std(ddof=0)
-                        result[f"{prefix}_slope"] = rolling.apply(_rolling_slope, raw=True)
+                        result[f"{prefix}_slope"] = rolling.apply(
+                            _rolling_slope, raw=True
+                        )
 
                     if isinstance(generator_use, Mapping) and gas_type in generator_use:
                         use_series, _ = _sum_role_series(frame, generator_use[gas_type])
@@ -290,9 +328,62 @@ class CausalFeatureBuilder:
                     holder_change = holder.diff()
                     shifted_change = holder_change.shift(1)
                     result[feature_name] = shifted_change / float(self.interval_minutes)
-                    result[f"feat_holder_level_{gas_type}"] = holder.shift(1)
-                    result[f"feat_holder_fill_{gas_type}"] = shifted_change.clip(lower=0.0)
-                    result[f"feat_holder_release_{gas_type}"] = (-shifted_change).clip(lower=0.0)
+                    if bool(
+                        self.feature_config.get("holder_momentum_enabled", False)
+                    ):
+                        momentum_steps = {
+                            int(value)
+                            for value in self.feature_config.get(
+                                "holder_momentum_steps", [1, 4, 8, 16]
+                            )
+                            if int(value) > 1
+                        }
+                        for steps in sorted(momentum_steps):
+                            result[
+                                f"feat_holder_change_rate_{gas_type}_{steps}"
+                            ] = holder.diff(steps).shift(1) / float(
+                                steps * self.interval_minutes
+                            )
+                        result[f"feat_holder_change_acceleration_{gas_type}"] = (
+                            holder_change.diff().shift(1)
+                            / float(self.interval_minutes**2)
+                        )
+                    shifted_level = holder.shift(1)
+                    result[f"feat_holder_level_{gas_type}"] = shifted_level
+                    result[f"feat_holder_fill_{gas_type}"] = shifted_change.clip(
+                        lower=0.0
+                    )
+                    result[f"feat_holder_release_{gas_type}"] = (-shifted_change).clip(
+                        lower=0.0
+                    )
+                    holder_capacity = self.feature_config.get("holder_capacity")
+                    if holder_capacity is not None:
+                        capacity = float(holder_capacity)
+                        minimum_fraction = float(
+                            self.feature_config.get("holder_safe_min_fraction", 0.15)
+                        )
+                        maximum_fraction = float(
+                            self.feature_config.get("holder_safe_max_fraction", 0.90)
+                        )
+                        if (
+                            capacity <= 0.0
+                            or not 0.0 <= minimum_fraction < maximum_fraction <= 1.0
+                        ):
+                            raise ValueError("气柜容量及安全区间配置无效")
+                        level_fraction = shifted_level / capacity
+                        low_margin = level_fraction - minimum_fraction
+                        high_margin = maximum_fraction - level_fraction
+                        result[f"feat_holder_level_fraction_{gas_type}"] = (
+                            level_fraction
+                        )
+                        result[f"feat_holder_low_margin_{gas_type}"] = low_margin
+                        result[f"feat_holder_high_margin_{gas_type}"] = high_margin
+                        result[f"feat_holder_safe_margin_{gas_type}"] = pd.concat(
+                            [low_margin, high_margin], axis=1
+                        ).min(axis=1)
+                        result[f"feat_holder_projected_fraction_{gas_type}"] = (
+                            shifted_level + shifted_change
+                        ) / capacity
                     if str(gas_type) in gas_balances:
                         available = gas_balances[str(gas_type)] - holder_change
                         gas_availability[str(gas_type)] = available
@@ -342,11 +433,73 @@ class CausalFeatureBuilder:
                     _rolling_slope, raw=True
                 )
 
+        self._add_gas_load_mismatch_features(frame, result, generator_use)
+
+    def _add_gas_load_mismatch_features(
+        self,
+        frame: pd.DataFrame,
+        result: MutableMapping[str, Any],
+        generator_use: Any,
+    ) -> None:
+        settings = self.feature_config.get("gas_load_mismatch", {})
+        if not isinstance(settings, Mapping) or not bool(settings.get("enabled", False)):
+            return
+        if not isinstance(generator_use, Mapping):
+            return
+
+        windows = sorted(
+            {
+                int(value)
+                for value in settings.get("windows", [4, 8, 16])
+                if int(value) >= 2
+            }
+        )
+        minimum_load = float(settings.get("minimum_load_mw", 1.0))
+        if minimum_load <= 0.0:
+            raise ValueError("耗气负荷失配特征的最小负荷必须大于 0")
+
+        targets = [str(value) for value in self.roles.get("targets", [])]
+        for gas_type, use_columns in generator_use.items():
+            use_series, source_columns = _sum_role_series(frame, use_columns)
+            if use_series is None:
+                continue
+            prefix = f"feat_gas_load_{gas_type}"
+            if not all(
+                self._source_allowed(column, 1, prefix) for column in source_columns
+            ):
+                continue
+            lagged_use = use_series.shift(1)
+            for target in targets:
+                if target not in frame or not self._source_allowed(target, 0, prefix):
+                    continue
+                load = pd.to_numeric(frame[target], errors="coerce").where(
+                    lambda values: values.abs() >= minimum_load
+                )
+                ratio = lagged_use / load
+                ratio_name = f"{prefix}_use_per_mw_{target}"
+                result[ratio_name] = ratio
+                history = ratio.shift(1)
+                for window in windows:
+                    rolling = history.rolling(
+                        window=window, min_periods=max(2, window // 2)
+                    )
+                    reference = rolling.median().replace(0.0, np.nan)
+                    result[f"{ratio_name}_{window}_relative_gap"] = (
+                        ratio / reference - 1.0
+                    )
+                    result[f"{ratio_name}_{window}_slope"] = rolling.apply(
+                        _rolling_slope, raw=True
+                    )
+
     def _add_operating_features(
         self, frame: pd.DataFrame, result: MutableMapping[str, Any]
     ) -> None:
-        online_threshold = float(self.feature_config.get("unit_online_threshold_mw", 1.0))
-        stable_threshold = float(self.feature_config.get("stable_delta_threshold_mw", 2.0))
+        online_threshold = float(
+            self.feature_config.get("unit_online_threshold_mw", 1.0)
+        )
+        stable_threshold = float(
+            self.feature_config.get("stable_delta_threshold_mw", 2.0)
+        )
         for target in self.roles.get("targets", []):
             target_name = str(target)
             if target_name not in frame:
@@ -358,22 +511,49 @@ class CausalFeatureBuilder:
             delta = load.diff()
             online = load > online_threshold
             result[f"feat_state_{target_name}_online"] = online.astype(np.int8)
-            result[f"feat_state_{target_name}_startup"] = (online & ~online.shift(1, fill_value=False)).astype(np.int8)
-            result[f"feat_state_{target_name}_shutdown"] = (~online & online.shift(1, fill_value=False)).astype(np.int8)
+            result[f"feat_state_{target_name}_startup"] = (
+                online & ~online.shift(1, fill_value=False)
+            ).astype(np.int8)
+            result[f"feat_state_{target_name}_shutdown"] = (
+                ~online & online.shift(1, fill_value=False)
+            ).astype(np.int8)
             result[f"feat_state_{target_name}_stable"] = (
                 online & (delta.abs() <= stable_threshold)
             ).astype(np.int8)
-            result[f"feat_state_{target_name}_ramp_up"] = (delta > stable_threshold).astype(np.int8)
-            result[f"feat_state_{target_name}_ramp_down"] = (delta < -stable_threshold).astype(np.int8)
-            result[f"feat_state_{target_name}_ramp_rate"] = delta / float(self.interval_minutes)
-            for window in (4, 8, 16, 32):
+            result[f"feat_state_{target_name}_ramp_up"] = (
+                delta > stable_threshold
+            ).astype(np.int8)
+            result[f"feat_state_{target_name}_ramp_down"] = (
+                delta < -stable_threshold
+            ).astype(np.int8)
+            result[f"feat_state_{target_name}_ramp_rate"] = delta / float(
+                self.interval_minutes
+            )
+            for window in (4, 8, 16, 32, 96):
                 history = load.shift(1).rolling(
                     window=window, min_periods=max(2, window // 2)
+                )
+                historical_mean = history.mean()
+                result[f"feat_state_{target_name}_{window}_mean_gap"] = (
+                    load - historical_mean
+                )
+                result[f"feat_state_{target_name}_{window}_relative_mean_gap"] = (
+                    load / historical_mean.replace(0.0, np.nan) - 1.0
                 )
                 result[f"feat_state_{target_name}_{window}_slope"] = history.apply(
                     _rolling_slope, raw=True
                 )
-                result[f"feat_state_{target_name}_{window}_volatility"] = history.std(ddof=0)
+                result[f"feat_state_{target_name}_{window}_volatility"] = history.std(
+                    ddof=0
+                )
+
+            steps_per_day = max(1, int(round(1440 / self.interval_minutes)))
+            result[f"feat_state_{target_name}_same_slot_day_delta"] = (
+                load - load.shift(steps_per_day)
+            )
+            result[f"feat_state_{target_name}_same_slot_week_delta"] = (
+                load - load.shift(7 * steps_per_day)
+            )
 
         if {"generator_1", "generator_all"}.issubset(frame.columns):
             one = pd.to_numeric(frame["generator_1"], errors="coerce")
